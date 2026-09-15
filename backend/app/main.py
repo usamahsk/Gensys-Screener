@@ -29,7 +29,7 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="KFC Voice Commerce API", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Pizza Bay Voice Commerce API", version="0.1.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,7 +50,7 @@ app.include_router(analytics.router)
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Log exactly what Dograh sent and why it failed — so a 422 is debuggable.
+    """Log exactly what the voice agent sent and why it failed — so a 422 is debuggable.
 
     Shows in `docker logs` / uvicorn stdout. The response body also carries the
     details so ngrok testers see them without server access.

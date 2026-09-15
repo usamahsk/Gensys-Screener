@@ -13,8 +13,8 @@ services:
   db:
     expose:
       - "5432"
-    # remove base-file port mapping "5433:5432"
-    ports: []
+    # reset base-file port mapping "5433:5432" so db is not publicly reachable
+    ports: !override []
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-kfc}
@@ -27,8 +27,8 @@ services:
   api:
     restart: unless-stopped
     # no dev mount / --reload here; uses Dockerfile CMD (uvicorn, no reload)
-    ports:
-      - "127.0.0.1:8100:8100"
+    # !override replaces base "8100:8100" with loopback-only bind
+    ports: !override ["127.0.0.1:8100:8100"]
     environment:
       KFC_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-kfc}:${KFC_DB_PASSWORD:-kfc}@db:5432/${POSTGRES_DB:-kfc}
       KFC_CORS_ORIGINS: https://dsquare.larynxai.in
@@ -44,8 +44,8 @@ services:
       context: ./frontend
       args:
         NEXT_PUBLIC_API_URL: https://dsquare.larynxai.in
-    ports:
-      - "127.0.0.1:3100:3000"
+    # !override replaces base "3100:3000" with loopback-only bind
+    ports: !override ["127.0.0.1:3100:3000"]
     environment:
       NEXT_PUBLIC_API_URL: https://dsquare.larynxai.in
     depends_on:

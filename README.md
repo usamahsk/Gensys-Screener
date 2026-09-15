@@ -1,6 +1,6 @@
-# KFC Voice AI — Ordering Assistant POC
+# Pizza Bay Voice AI — Ordering Assistant POC
 
-Voice AI ordering assistant for KFC (takeaway / dine-in) built on **Dograh**, with an
+Voice AI ordering assistant for Pizza Bay (takeaway / dine-in) built on **Dograh**, with an
 operations dashboard. Phase 2 **Genesys Cloud** integration is wired but dormant — it
 activates when credentials are configured (no code changes needed).
 
@@ -25,7 +25,7 @@ docker compose up -d --build
 | API       | http://localhost:8100/api/health |
 | Swagger   | http://localhost:8100/docs   |
 
-The database seeds itself on first boot: KFC menu (25 items), 15 FAQs (embedded),
+The database seeds itself on first boot: Pizza Bay menu (25 items), 15 FAQs (embedded),
 sample orders, customers and calls — so the dashboard is usable immediately.
 
 Optional: set `KFC_GEMINI_API_KEY` on the `api` service for LLM-quality call

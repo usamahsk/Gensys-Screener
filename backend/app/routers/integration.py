@@ -1,6 +1,6 @@
-"""Dograh integration: settings + proxied runs/transcripts/recordings.
+"""Voice platform integration: settings + proxied runs/transcripts/recordings.
 
-Allows the dashboard to pull calls directly from a Dograh instance using a
+Allows the dashboard to pull calls directly from a voice platform instance using a
 user-managed API key (X-API-Key), and to import a run into the Call Logs +
 Orders so the analytics populate even without the post-call webhook.
 """
@@ -115,7 +115,7 @@ async def update_dograh_setting(req: DograhSettingRequest, db: AsyncSession = De
 async def dograh_health(db: AsyncSession = Depends(get_db)):
     s = await _get_setting(db)
     if not s.api_key:
-        raise HTTPException(400, "No Dograh API key configured")
+        raise HTTPException(400, "No voice platform API key configured")
     return await dograh_client.dograh_health_check(s.api_key, s.base_url)
 
 
@@ -124,26 +124,26 @@ async def get_dograh_models(db: AsyncSession = Depends(get_db)):
     """Current org-level AI model configuration (provider keys are masked)."""
     s = await _get_setting(db)
     if not s.api_key:
-        raise HTTPException(400, "No Dograh API key configured")
+        raise HTTPException(400, "No voice platform API key configured")
     try:
         return await dograh_client.get_model_config(s.api_key, s.base_url)
     except Exception as e:
-        raise HTTPException(502, f"Dograh request failed: {e}")
+        raise HTTPException(502, f"Voice platform request failed: {e}")
 
 
 @router.put("/models", response_model=dict)
 async def save_dograh_models(payload: dict, db: AsyncSession = Depends(get_db)):
     """Save org-level AI model configuration (BYOK providers + keys, or
-    Dograh-managed). Masked keys sent back are preserved by Dograh."""
+    platform-managed). Masked keys sent back are preserved by the voice platform."""
     s = await _get_setting(db)
     if not s.api_key:
-        raise HTTPException(400, "No Dograh API key configured")
+        raise HTTPException(400, "No voice platform API key configured")
     try:
         result = await dograh_client.save_model_config(s.api_key, s.base_url, payload)
     except Exception as e:
-        raise HTTPException(502, f"Dograh request failed: {e}")
+        raise HTTPException(502, f"Voice platform request failed: {e}")
     if result["status"] >= 400:
-        raise HTTPException(result["status"], f"Dograh rejected the configuration: {result['body']}")
+        raise HTTPException(result["status"], f"Voice platform rejected the configuration: {result['body']}")
     return result["body"]
 
 
@@ -157,14 +157,14 @@ async def list_dograh_runs(
 ):
     s = await _get_setting(db)
     if not s.api_key:
-        raise HTTPException(400, "No Dograh API key configured")
+        raise HTTPException(400, "No voice platform API key configured")
     try:
         data = await dograh_client.list_runs(
             s.api_key, s.base_url, page=page, limit=limit,
             start_date=start_date, end_date=end_date,
         )
     except Exception as e:
-        raise HTTPException(502, f"Dograh request failed: {e}")
+        raise HTTPException(502, f"Voice platform request failed: {e}")
 
     runs = []
     for r in data.get("runs", []):
@@ -200,14 +200,14 @@ async def run_detail(
     workflow_id: int,
     db: AsyncSession = Depends(get_db),
 ):
-    """Full run detail from Dograh (resolves public transcript/recording URLs)."""
+    """Full run detail from the voice platform (resolves public transcript/recording URLs)."""
     s = await _get_setting(db)
     if not s.api_key:
-        raise HTTPException(400, "No Dograh API key configured")
+        raise HTTPException(400, "No voice platform API key configured")
     try:
         return await dograh_client.get_run_detail(s.api_key, s.base_url, workflow_id, run_id)
     except Exception as e:
-        raise HTTPException(502, f"Dograh request failed: {e}")
+        raise HTTPException(502, f"Voice platform request failed: {e}")
 
 
 @router.get("/runs/{run_id}/transcript", response_model=dict)
@@ -219,7 +219,7 @@ async def run_transcript(
     """Fetch the transcript text for a run (resolves the public URL via run detail)."""
     s = await _get_setting(db)
     if not s.api_key:
-        raise HTTPException(400, "No Dograh API key configured")
+        raise HTTPException(400, "No voice platform API key configured")
     transcript_url: Optional[str] = None
     if workflow_id:
         try:
@@ -241,16 +241,16 @@ async def run_transcript(
 
 @router.get("/file")
 async def proxy_dograh_file(url: str, db: AsyncSession = Depends(get_db)):
-    """Stream a Dograh recording/transcript file through our backend so the
-    browser can play it without touching Dograh/ngrok/storage directly."""
+    """Stream a voice platform recording/transcript file through our backend so the
+    browser can play it without touching the voice platform/storage directly."""
     from fastapi.responses import StreamingResponse
 
     s = await _get_setting(db)
     if not s.api_key:
-        raise HTTPException(400, "No Dograh API key configured")
+        raise HTTPException(400, "No voice platform API key configured")
     data, content_type = await dograh_client.fetch_public_bytes(url, s.base_url)
     if not data:
-        raise HTTPException(502, "Could not fetch file from Dograh storage")
+        raise HTTPException(502, "Could not fetch file from voice platform storage")
     return StreamingResponse(iter([data]), media_type=content_type)
 
 
@@ -260,7 +260,7 @@ async def find_run_by_call_uuid(call_uuid: str, db: AsyncSession = Depends(get_d
     (gathered_context.call_id / workflow_run_id). Scans recent runs."""
     s = await _get_setting(db)
     if not s.api_key:
-        raise HTTPException(400, "No Dograh API key configured")
+        raise HTTPException(400, "No voice platform API key configured")
     try:
         page = 1
         scanned = 0
@@ -280,7 +280,7 @@ async def find_run_by_call_uuid(call_uuid: str, db: AsyncSession = Depends(get_d
                 break
             page += 1
     except Exception as e:
-        raise HTTPException(502, f"Dograh request failed: {e}")
+        raise HTTPException(502, f"Voice platform request failed: {e}")
     return {"found": False, "run_id": None, "workflow_id": None}
 
 
@@ -290,18 +290,18 @@ async def import_run(
     workflow_id: int,
     db: AsyncSession = Depends(get_db),
 ):
-    """Import a Dograh run into the local Call Logs + Orders, so analytics and
-    the dashboard populate directly from Dograh (webhook optional)."""
+    """Import a voice platform run into the local Call Logs + Orders, so analytics and
+    the dashboard populate directly from the voice platform (webhook optional)."""
     s = await _get_setting(db)
     if not s.api_key:
-        raise HTTPException(400, "No Dograh API key configured")
+        raise HTTPException(400, "No voice platform API key configured")
 
     try:
         detail = await dograh_client.get_run_detail(s.api_key, s.base_url, workflow_id, run_id)
     except Exception as e:
-        raise HTTPException(502, f"Dograh request failed: {e}")
+        raise HTTPException(502, f"Voice platform request failed: {e}")
 
-    call_id = f"dograh_{run_id}"
+    call_id = f"voice_{run_id}"
     existing = (await db.execute(select(Call).where(Call.call_id == call_id))).scalar_one_or_none()
     if existing:
         return {"status": "duplicate", "call_id": call_id}
@@ -373,7 +373,7 @@ async def import_run(
 
 
 def _turns_and_tools_from_events(detail: dict) -> tuple[list[dict], list[dict]]:
-    """Build turn-by-turn transcript + tool calls from Dograh realtime events."""
+    """Build turn-by-turn transcript + tool calls from voice platform realtime events."""
     turns: list[dict] = []
     tools: list[dict] = []
     started: dict[str, dict] = {}
@@ -475,7 +475,7 @@ async def _import_order(db: AsyncSession, gc: dict, customer_name: str, phone: s
             unit_price=Decimal(str(item.get("price", 0))),
             size=item.get("size", ""), notes=item.get("notes", ""),
         ))
-    db.add(OrderEvent(order_id=order.id, status="confirmed", note="Imported from Dograh run"))
+        db.add(OrderEvent(order_id=order.id, status="confirmed", note="Imported from voice platform run"))
 
 
 async def _embed(text: str):

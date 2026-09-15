@@ -1,4 +1,4 @@
-"""Tool endpoints called by the Dograh voice agent during live calls."""
+"""Tool endpoints called by the voice agent during live calls."""
 
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -27,8 +27,25 @@ from app.services.embeddings import embed_one
 router = APIRouter(prefix="/api/tools", tags=["agent-tools"])
 
 
+# Order numbers: PB- + 3 phone-safe chars (no I/L/O/0/1 — unambiguous over voice).
+_ORDER_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+
 def _gen_order_number() -> str:
-    return f"KFC-{secrets.token_hex(3).upper()}"
+    return f"PB-{''.join(secrets.choice(_ORDER_CODE_ALPHABET) for _ in range(3))}"
+
+
+async def _gen_unique_order_number(db: AsyncSession) -> str:
+    """Generate a PB- code not already in use (the 3-char space is small)."""
+    for _ in range(10):
+        num = _gen_order_number()
+        exists = (
+            await db.execute(select(Order.id).where(Order.order_number == num))
+        ).scalar_one_or_none()
+        if exists is None:
+            return num
+    # Practically unreachable — fall back to a longer code rather than failing.
+    return f"PB-{''.join(secrets.choice(_ORDER_CODE_ALPHABET) for _ in range(6))}"
 
 
 async def _log_tool_call(
@@ -179,8 +196,9 @@ async def create_order(
     if fee_applied:
         total = round(total + DELIVERY_FEE, 2)
 
+    order_number = await _gen_unique_order_number(db)
     order = Order(
-        order_number=_gen_order_number(),
+        order_number=order_number,
         customer_name=req.customer_name.strip(),
         customer_phone=req.customer_phone.strip(),
         email=clean_str(req.email),
@@ -317,7 +335,7 @@ async def order_status(
 
 @router.get("/order-status", response_model=OrderStatusResponse)
 async def order_status_query(
-    order_number: str = Query(..., description="Order number, e.g. KFC-A1B2C3"),
+    order_number: str = Query(..., description="Order number, e.g. PB-A1B"),
     db: AsyncSession = Depends(get_db),
     call_id: Optional[str] = Query(default="", description="Call id, e.g. {{workflow_run_id}}"),
     first_name: Optional[str] = Query(default=""),

@@ -279,7 +279,7 @@ export default function ModelsPage() {
 
       <p className="text-xs text-muted-foreground">
         Masked keys (e.g. sk-…ab12) are preserved when saved. Typing a new key replaces it.
-        Agent-level model overrides are rare for a single-agent org — the org config above covers your KFC agent.
+        Agent-level model overrides are rare for a single-agent org — the org config above covers your Pizza Bay agent.
       </p>
     </div>
   );

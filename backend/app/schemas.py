@@ -396,7 +396,7 @@ class CallEndedWebhook(BaseModel):
     payment_method: str = ""
     order_numbers: list[str] = []
 
-    # reservation (not used in KFC scope — tolerated)
+    # reservation (not used in Pizza Bay scope — tolerated)
     reservation_completed: bool = False
     reservation_confirmed: bool = False
     party_size: int | None = None

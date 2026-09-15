@@ -126,7 +126,7 @@ export default function SettingsPage() {
               type="password"
               value={apiKey}
               onChange={(e) => setApiKey(e.target.value)}
-              placeholder={setting?.has_key ? `Saved: ${setting.api_key_masked}` : "dg_..."}
+              placeholder={setting?.has_key ? `Saved: ${setting.api_key_masked}` : "Enter API key"}
             />
             <p className="text-xs text-muted-foreground">
               {setting?.has_key ? "A key is already saved — leave blank to keep it, or type a new one to replace." : "Paste your voice platform API key."}

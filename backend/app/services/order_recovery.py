@@ -33,6 +33,13 @@ MAX_TRANSCRIPT_CHARS = 15000
 DELIVERY_FEE = 2.50
 FREE_DELIVERY_ABOVE = 25.00
 
+# Order numbers: PB- + 3 phone-safe chars (kept in sync with routers/tools.py).
+_ORDER_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+
+
+def _gen_order_number() -> str:
+    return f"PB-{''.join(secrets.choice(_ORDER_CODE_ALPHABET) for _ in range(3))}"
+
 MENU = """PIZZAS (Small / Medium / Large) — crust Regular or Thin at no extra charge:
 - Margherita Pizza (Veg): 8.99 / 11.99 / 14.99
 - Pepperoni Pizza (Non-Veg): 9.99 / 12.99 / 15.99
@@ -287,8 +294,17 @@ async def create_order_from_transcript(
 
     items, total, _fee = _finalize_items(req, _clean(req.delivery_address))
 
+    order_number = _gen_order_number()
+    for _ in range(10):  # 3-char space is small — retry on (unlikely) collision
+        exists = (
+            await db.execute(select(Order.id).where(Order.order_number == order_number))
+        ).scalar_one_or_none()
+        if exists is None:
+            break
+        order_number = _gen_order_number()
+
     order = Order(
-        order_number=f"KFC-{secrets.token_hex(3).upper()}",
+        order_number=order_number,
         customer_name=(req.customer_name or "").strip() or customer_name,
         customer_phone=(req.customer_phone or "").strip() or customer_phone,
         email=_clean(req.email), order_type=req.order_type,

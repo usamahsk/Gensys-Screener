@@ -12,6 +12,7 @@ Dograh runs in Docker, so `localhost` from Dograh's container is NOT your machin
 |--------------------------------------------|----------------------------------------|
 | Docker Desktop (Mac/Windows)               | `http://host.docker.internal:8100`     |
 | Docker on Linux                            | `http://<your-machine-LAN-IP>:8100`    |
+| Deployed (dsquare)                         | `https://dsquare.larynxai.in`          |
 | Azure / deployed                           | `https://<kfc-api-container-app-url>`  |
 
 Replace `<BASE>` below accordingly. All requests need header `Content-Type: application/json` (POST only).
@@ -80,7 +81,7 @@ Sample request (all fields):
 Sample response (201):
 ```json
 {
-  "order_number": "KFC-A1B2C3",
+  "order_number": "PB-A1B",
   "total": "998.00",
   "status": "confirmed",
   "items": [
@@ -98,7 +99,7 @@ Parameters (query):
 
 | name         | type   | required | description for the LLM |
 |--------------|--------|----------|--------------------------|
-| order_number | string | yes      | The order number the customer provided, e.g. KFC-A1B2C3 |
+| order_number | string | yes      | The order number the customer provided, e.g. PB-A1B |
 | call_id | string | no | Preset `{{workflow_run_id}}` — logs a Call Logs row of type `order_status` |
 | first_name | string | no | Preset `{{initial_context.first_name}}` |
 | rsvp | string | no | Preset `{{gathered_context.rsvp}}` |
@@ -113,7 +114,7 @@ Sample response:
 {
   "found": true,
   "order": {
-    "order_number": "KFC-A1B2C3",
+    "order_number": "PB-A1B",
     "status": "preparing",
     "order_type": "takeaway",
     "pickup_time": "7:30 PM",
@@ -143,10 +144,10 @@ Sample response:
   "phone": "+919812345670",
   "name": "Rohan Mehta",
   "last_intent": "order_placement",
-  "last_order_number": "KFC-A1B2C3",
+  "last_order_number": "PB-A1B",
   "context": {},
   "recent_memories": [
-    { "kind": "order", "text": "Placed order KFC-A1B2C3: 1x Family Fest Bucket...", "created_at": "..." },
+    { "kind": "order", "text": "Placed order PB-A1B: 1x Family Fest Bucket...", "created_at": "..." },
     { "kind": "note", "text": "Prefers family buckets, usually orders for 4 people.", "created_at": "..." }
   ]
 }
@@ -156,15 +157,18 @@ never make them repeat their history.
 
 ## Tool 4 — `record_customer_memory`
 
-**Method:** `POST`  **URL:** `<BASE>/api/tools/memory`
+**Method:** `POST`  **URL:** `<BASE>/api/tools/memory/{{phone}}` (phone goes in the
+path — there is no body-only variant)
+
+Header: `Content-Type: application/json`
 
 | name  | type   | required | description |
 |-------|--------|----------|-------------|
-| phone | string | yes      | Customer's phone number |
 | text  | string | yes      | One-line note worth remembering: preferences, what they asked about, complaints |
-| kind  | string | no       | "order" | "trace" | "note". Default "note" |
+| kind  | string | no       | "order" \| "trace" \| "note" \| "call_summary". Default "note" |
 
-Sample request: `{ "phone": "+919812345670", "text": "Prefers spicy food, asked about Peri Peri", "kind": "note" }`
+Sample request to `<BASE>/api/tools/memory/+919812345670`:
+`{ "text": "Prefers spicy food, asked about Peri Peri", "kind": "note" }`
 Response: `201` with the stored memory object.
 
 ---
@@ -187,7 +191,7 @@ Response: `201` with the stored memory object.
   "customer_phone": "+919812345670",
   "transcript": [ { "role": "customer", "content": "..." }, { "role": "assistant", "content": "..." } ],
   "tool_calls": [ { "name": "create_order", "args_summary": "Pepperoni Large x1" } ],
-  "order_numbers": ["KFC-A1B2C3"]
+  "order_numbers": ["PB-A1B"]
 }
 ```
 `disposition`: completed | transferred | failed | abandoned.
@@ -201,14 +205,16 @@ human agent sees on the dashboard's Agent View.
 
 ---
 
-## Agent system prompt additions (KFC)
+## Agent system prompt additions (Pizza Bay)
 
 ```
-You are KFC's phone ordering assistant.
+You are Pizza Bay's phone ordering assistant.
 - Greet callers; after getting their phone number, call get_customer_memory and
   use it to greet returning customers by name and continue past conversations.
 - Confirm item, quantity, and type (takeaway/dinein + table no. or pickup time)
   before calling create_order. Read back the order total and order number.
+  Order numbers look like PB-X7K (PB- plus 3 characters) — read them back
+  letter by letter.
 - For "where is my order" questions, call get_order_status and answer naturally.
 - Requests about refunds, payments, complaints, or policy exceptions always go
   to a human.

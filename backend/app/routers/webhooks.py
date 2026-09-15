@@ -1,8 +1,8 @@
-"""Webhooks from Dograh: post-call logging and escalation handoff.
+"""Webhooks from the voice platform: post-call logging and escalation handoff.
 
-Transfer flow: when the voice agent escalates, Dograh calls /transfer; we
+Transfer flow: when the voice agent escalates, the voice platform calls /transfer; we
 record the reason + build the agent context payload. If Genesys OAuth creds
-are configured on the Dograh side, the same context is pushed to the Genesys
+are configured on the voice platform side, the same context is pushed to the Genesys
 conversation as participant attributes (handled in dograh-claude's
 genesys provider session_logger) — this endpoint is the app-side record for
 the dashboard's agent view.

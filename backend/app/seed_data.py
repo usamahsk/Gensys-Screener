@@ -23,7 +23,7 @@ SAMPLE_CALLS = [
         "customer_phone": "+919812345670",
         "summary": (
             "Customer wanted a large pepperoni pizza for a family dinner. AI confirmed size Large, "
-            "added a large Coke, and placed takeaway order KFC-A1B2C3 for $848 for pickup at 7:30 PM. "
+            "added a large Coke, and placed takeaway order PB-A1B for $848 for pickup at 7:30 PM. "
             "Call completed successfully."
         ),
         "transcript": [
@@ -32,12 +32,12 @@ SAMPLE_CALLS = [
             {"role": "customer", "content": "Large, and add a large Coke."},
             {"role": "assistant", "content": "Large Pepperoni $749 and Large Coke $99, total $848. Takeaway or dine-in?"},
             {"role": "customer", "content": "Takeaway, pickup around 7:30 PM. Rohan Mehta, 9812345670."},
-            {"role": "assistant", "content": "Order placed! Your order number is KFC-A1B2C3. Pickup at 7:30 PM. Thank you!"},
+            {"role": "assistant", "content": "Order placed! Your order number is PB-A1B. Pickup at 7:30 PM. Thank you!"},
         ],
         "tool_calls": [
             {"name": "create_order", "args_summary": "PZ-PEP-L, DRK-COK-L, takeaway 7:30 PM"},
         ],
-        "order_numbers": ["KFC-A1B2C3"],
+        "order_numbers": ["PB-A1B"],
         "sentiment": "positive",
         "escalation_reason": "",
     },
@@ -48,21 +48,21 @@ SAMPLE_CALLS = [
         "customer_name": "Priya Sharma",
         "customer_phone": "+919812345671",
         "summary": (
-            "Customer checked order KFC-D4E5F6 (In transit) and later reported she was double-charged "
+            "Customer checked order PB-D4E (In transit) and later reported she was double-charged "
             "on a previous online payment. Payment disputes are outside AI scope, so the call was "
             "transferred to a human agent with the full summary and order context."
         ),
         "transcript": [
-            {"role": "customer", "content": "Where is my order KFC-D4E5F6?"},
-            {"role": "assistant", "content": "Order KFC-D4E5F6 is in transit, expected in 15 minutes."},
+            {"role": "customer", "content": "Where is my order PB-D4E?"},
+            {"role": "assistant", "content": "Order PB-D4E is in transit, expected in 15 minutes."},
             {"role": "customer", "content": "Also, I was charged twice for my last online order. I need a refund."},
             {"role": "assistant", "content": "I'm sorry about that. Payment refunds need a human agent — connecting you now with full context so you don't have to repeat."},
         ],
         "tool_calls": [
-            {"name": "order_status", "args_summary": "KFC-D4E5F6"},
+            {"name": "order_status", "args_summary": "PB-D4E"},
             {"name": "transfer_to_agent", "args_summary": "payment dispute"},
         ],
-        "order_numbers": ["KFC-D4E5F6"],
+        "order_numbers": ["PB-D4E"],
         "sentiment": "negative",
         "escalation_reason": "Payment issue: double charge reported, refund requested",
     },
@@ -86,17 +86,17 @@ SAMPLE_CALLS = [
 
 SAMPLE_ORDERS = [
     # (number, name, phone, email, type, table, pickup, status, items[(name, qty, price)], age_days)
-    ("KFC-A1B2C3", "Rohan Mehta", "+919812345670", "", "takeaway", "", "7:30 PM", "confirmed",
+    ("PB-A1B", "Rohan Mehta", "+919812345670", "", "takeaway", "", "7:30 PM", "confirmed",
      [("Pepperoni Pizza Large", 1, 749), ("Coke Large", 1, 99)], 0),
-    ("KFC-D4E5F6", "Priya Sharma", "+919812345671", "priya@example.com", "takeaway", "", "", "in_transit",
+    ("PB-D4E", "Priya Sharma", "+919812345671", "priya@example.com", "takeaway", "", "", "in_transit",
      [("Margherita Pizza Medium", 1, 349), ("Coke Regular", 1, 60)], 0),
-    ("KFC-G7H8I9", "Arjun Verma", "+919812345673", "", "dinein", "12", "", "completed",
+    ("PB-G7H", "Arjun Verma", "+919812345673", "", "dinein", "12", "", "completed",
      [("Pepperoni Pizza Regular", 1, 299), ("Coke Regular", 2, 60)], 1),
-    ("KFC-J1K2L3", "Sneha Iyer", "+919812345674", "", "takeaway", "", "8:00 PM", "preparing",
+    ("PB-J1K", "Sneha Iyer", "+919812345674", "", "takeaway", "", "8:00 PM", "preparing",
      [("Margherita Pizza Large", 1, 549), ("Coke Regular", 1, 60)], 0),
-    ("KFC-M4N5O6", "Vikram Singh", "+919812345675", "", "dinein", "4", "", "completed",
+    ("PB-M4N", "Vikram Singh", "+919812345675", "", "dinein", "4", "", "completed",
      [("Pepperoni Pizza Medium", 1, 499), ("Coke Large", 1, 99)], 2),
-    ("KFC-P7Q8R9", "Rohan Mehta", "+919812345670", "", "takeaway", "", "", "cancelled",
+    ("PB-P7Q", "Rohan Mehta", "+919812345670", "", "takeaway", "", "", "cancelled",
      [("Margherita Pizza Regular", 2, 199)], 3),
 ]
 
@@ -111,7 +111,7 @@ async def seed_if_empty(db: AsyncSession) -> dict:
             order = Order(order_number=num, customer_name=name, customer_phone=phone,
                           email=email, order_type=otype, table_number=table,
                           pickup_time=pickup, status=status, source="voice_agent",
-                          call_id="call_seed_001" if num == "KFC-A1B2C3" else "",
+                          call_id="call_seed_001" if num == "PB-A1B" else "",
                           created_at=created, updated_at=created)
             db.add(order)
             await db.flush()
@@ -136,11 +136,11 @@ async def seed_if_empty(db: AsyncSession) -> dict:
     cust_count = (await db.execute(select(func.count(Customer.id)))).scalar() or 0
     if cust_count == 0:
         customers = [
-            ("+919812345670", "Rohan Mehta", "order_placement", "KFC-A1B2C3",
-             ["Placed order KFC-A1B2C3: Large Pepperoni Pizza + Large Coke, total $848, takeaway pickup 7:30 PM.",
+            ("+919812345670", "Rohan Mehta", "order_placement", "PB-A1B",
+             ["Placed order PB-A1B: Large Pepperoni Pizza + Large Coke, total $848, takeaway pickup 7:30 PM.",
               "Prefers pepperoni, usually orders large for family nights."]),
-            ("+919812345671", "Priya Sharma", "support", "KFC-D4E5F6",
-             ["Checked order KFC-D4E5F6 (in transit). Later reported a double-charge payment issue and was transferred.",
+            ("+919812345671", "Priya Sharma", "support", "PB-D4E",
+             ["Checked order PB-D4E (in transit). Later reported a double-charge payment issue and was transferred.",
               "Has an open payment dispute - handle with care."]),
         ]
         for phone, name, intent, last_order, notes in customers:
