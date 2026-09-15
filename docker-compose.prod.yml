@@ -34,6 +34,8 @@ services:
       KFC_CORS_ORIGINS: https://dsquare.larynxai.in
       KFC_GEMINI_API_KEY: ${KFC_GEMINI_API_KEY:-}
       KFC_GEMINI_MODEL: ${KFC_GEMINI_MODEL:-gemini-2.0-flash}
+      # Prod never boot-seeds demo data — an empty DB stays empty.
+      KFC_SEED_ENABLED: "false"
     env_file:
       - path: .env.prod
         required: false

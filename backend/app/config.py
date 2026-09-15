@@ -14,6 +14,11 @@ class Settings(BaseSettings):
 
     embedding_dim: int = 256
 
+    # Boot seeding (sample orders/customers/calls when tables are empty).
+    # Dev default true; production overlay forces false so prod stays clean
+    # and a wipe is never silently re-seeded on restart.
+    seed_enabled: bool = True
+
     class Config:
         env_file = ".env"
         env_prefix = "KFC_"

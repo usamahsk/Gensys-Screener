@@ -18,6 +18,10 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    if not settings.seed_enabled:
+        logger.info("Boot seeding disabled (KFC_SEED_ENABLED=false) — starting with existing data only")
+        yield
+        return
     from app.db import SessionLocal
 
     from app.seed_data import seed_if_empty

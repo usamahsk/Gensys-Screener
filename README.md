@@ -27,6 +27,8 @@ docker compose up -d --build
 
 The database seeds itself on first boot: Pizza Bay menu (25 items), 15 FAQs (embedded),
 sample orders, customers and calls — so the dashboard is usable immediately.
+Set `KFC_SEED_ENABLED=false` on the `api` service to disable this (the production
+overlay already forces it off, so prod starts and stays clean).
 
 Optional: set `KFC_GEMINI_API_KEY` on the `api` service for LLM-quality call
 summaries + embeddings. Without it everything still works offline (local
