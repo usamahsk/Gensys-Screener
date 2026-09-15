@@ -1,0 +1,46 @@
+name: kfc-voice
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: kfc
+      POSTGRES_PASSWORD: kfc
+      POSTGRES_DB: kfc
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kfc"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ./backend
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      KFC_DATABASE_URL: postgresql+asyncpg://kfc:kfc@db:5432/kfc
+      KFC_CORS_ORIGINS: "*"
+      # Optional — better summaries/embeddings when set, app works without:
+      # KFC_GEMINI_API_KEY: ""
+    ports:
+      - "8100:8100"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  dashboard:
+    build: ./frontend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8100
+    ports:
+      - "3100:3000"
+    depends_on:
+      - api
+
+volumes:
+  pgdata:

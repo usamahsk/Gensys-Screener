@@ -1,0 +1,10 @@
+# Dev-only: live code mount + auto-reload so backend edits apply on save.
+# Compose merges this automatically with docker-compose.yml.
+# The base file stays clean for Azure/prod deploys (no mount, no --reload there).
+name: kfc-voice
+
+services:
+  api:
+    volumes:
+      - ./backend/app:/app/app
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8100", "--reload"]

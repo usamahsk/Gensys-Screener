@@ -1,0 +1,185 @@
+"""Proxy client for the Dograh REST API.
+
+The dashboard talks to Dograh with a user-managed API key (X-API-Key header).
+Endpoints used:
+  - GET /api/v1/organizations/usage/runs        (list runs + public urls)
+  - GET /api/v1/workflow/{workflow_id}/runs/{run_id}  (run detail)
+
+The base URL defaults to https://voice.larynxai.in and is overridable in the
+integration settings.
+"""
+
+from typing import Any, Optional
+
+import httpx
+from loguru import logger
+
+from app.config import get_settings
+
+settings = get_settings()
+
+DEFAULT_BASE_URL = "https://voice.larynxai.in"
+
+
+def _base(base_url: str) -> str:
+    return (base_url or DEFAULT_BASE_URL).rstrip("/")
+
+
+async def dograh_health_check(api_key: str, base_url: str) -> dict:
+    """Ping the Dograh health endpoint to verify base URL + key connectivity."""
+    url = f"{_base(base_url)}/api/v1/health"
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(url)
+            if r.status_code != 200:
+                return {"ok": False, "status": r.status_code, "detail": r.text[:200]}
+            return {"ok": True, "status": r.status_code, "data": r.json()}
+    except Exception as e:
+        return {"ok": False, "status": None, "detail": str(e)}
+
+
+async def list_runs(
+    api_key: str,
+    base_url: str,
+    page: int = 1,
+    limit: int = 50,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"page": page, "limit": min(limit, 100)}
+    if start_date:
+        params["start_date"] = start_date
+    if end_date:
+        params["end_date"] = end_date
+    url = f"{_base(base_url)}/api/v1/organizations/usage/runs"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(url, params=params, headers={"X-API-Key": api_key})
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"Dograh list_runs failed ({e.response.status_code}): {e.response.text[:200]}")
+        raise
+    except Exception as e:
+        logger.warning(f"Dograh list_runs error: {e}")
+        raise
+
+
+async def get_run_detail(
+    api_key: str, base_url: str, workflow_id: int, run_id: int
+) -> dict[str, Any]:
+    url = f"{_base(base_url)}/api/v1/workflow/{workflow_id}/runs/{run_id}"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.get(url, headers={"X-API-Key": api_key})
+            r.raise_for_status()
+            return r.json()
+    except httpx.HTTPStatusError as e:
+        logger.warning(f"Dograh get_run_detail failed ({e.response.status_code}): {e.response.text[:200]}")
+        raise
+    except Exception as e:
+        logger.warning(f"Dograh get_run_detail error: {e}")
+        raise
+
+
+async def fetch_public_text(url: str, base_url: str = "") -> str:
+    """Fetch a time-limited public transcript URL (text). Resolves the
+    storage redirect and rewrites localhost hosts so it works from Docker."""
+    data, _ = await fetch_public_bytes(url, base_url)
+    try:
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _with_host(url: str, base: str) -> str:
+    """Replace scheme+host of url with base's (keeps path/query)."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    b = urlsplit(base)
+    u = urlsplit(url)
+    return urlunsplit((b.scheme, b.netloc, u.path, u.query, u.fragment))
+
+
+def _container_reachable(url: str) -> str:
+    """localhost inside a container is itself — point it at the host."""
+    from urllib.parse import urlsplit, urlunsplit
+
+    u = urlsplit(url)
+    host = u.hostname or ""
+    if host in ("localhost", "127.0.0.1"):
+        netloc = u.netloc.replace(host, "host.docker.internal", 1)
+        return urlunsplit((u.scheme, netloc, u.path, u.query, u.fragment))
+    return url
+
+
+async def fetch_public_bytes(url: str, base_url: str = "") -> tuple[bytes, str]:
+    """Resolve a Dograh public/storage URL to raw bytes.
+
+    Public download links 302 to the storage service (often localhost:8080),
+    which a container can't reach directly — so hosts are rewritten for
+    container→host access at each hop.
+    """
+    base = _base(base_url) if base_url else ""
+    current = _container_reachable(_with_host(url, base)) if base else _container_reachable(url)
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
+            for _ in range(5):
+                r = await client.get(current)
+                if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
+                    current = _container_reachable(r.headers["location"])
+                    continue
+                if r.status_code == 200:
+                    ctype = r.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
+                    return r.content, _fix_content_type(ctype, current, r.content)
+                logger.warning(f"fetch_public_bytes {r.status_code} for {current[:100]}")
+                return b"", ""
+    except Exception as e:
+        logger.warning(f"fetch_public_bytes error: {e}")
+    return b"", ""
+
+
+def _fix_content_type(ctype: str, url: str, data: bytes) -> str:
+    """Storage often serves everything as octet-stream, which browsers refuse
+    to play in <audio>. Correct it from extension + magic bytes."""
+    if ctype != "application/octet-stream":
+        return ctype
+    lower = url.lower().split("?")[0]
+    if lower.endswith(".wav"):
+        return "audio/wav"
+    if lower.endswith(".mp3"):
+        return "audio/mpeg"
+    if lower.endswith(".ogg") or lower.endswith(".oga"):
+        return "audio/ogg"
+    if lower.endswith(".m4a"):
+        return "audio/mp4"
+    if lower.endswith(".txt"):
+        return "text/plain; charset=utf-8"
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "audio/wav"
+    if data[:3] == b"ID3" or (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0):
+        return "audio/mpeg"
+    if data[:4] == b"OggS":
+        return "audio/ogg"
+    return ctype
+
+
+async def get_model_config(api_key: str, base_url: str) -> dict[str, Any]:
+    """GET org-level AI model configuration (masked keys)."""
+    url = f"{_base(base_url)}/api/v1/organizations/model-configurations/v2"
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.get(url, headers={"X-API-Key": api_key})
+        r.raise_for_status()
+        return r.json()
+
+
+async def save_model_config(api_key: str, base_url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """PUT org-level AI model configuration (BYOK keys or Dograh-managed)."""
+    url = f"{_base(base_url)}/api/v1/organizations/model-configurations/v2"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.put(
+            url,
+            json=payload,
+            headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+        )
+        return {"status": r.status_code, "body": r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text[:1000]}

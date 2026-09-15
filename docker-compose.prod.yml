@@ -1,0 +1,52 @@
+name: kfc-voice
+
+# Production overlay for dsquare.larynxai.in (host nginx, no Caddy).
+# Usage on server:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build
+#
+# - Binds app ports to 127.0.0.1 only; public traffic enters via host nginx :80/:443.
+# - Dashboard is built with NEXT_PUBLIC_API_URL=https://dsquare.larynxai.in so the
+#   browser calls the same origin; nginx routes /api/* to the api service.
+# - db has no published port in prod (not reachable from outside the compose net).
+
+services:
+  db:
+    expose:
+      - "5432"
+    # remove base-file port mapping "5433:5432"
+    ports: []
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-kfc}
+      POSTGRES_PASSWORD: ${KFC_DB_PASSWORD:-kfc}
+      POSTGRES_DB: ${POSTGRES_DB:-kfc}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  api:
+    restart: unless-stopped
+    # no dev mount / --reload here; uses Dockerfile CMD (uvicorn, no reload)
+    ports:
+      - "127.0.0.1:8100:8100"
+    environment:
+      KFC_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-kfc}:${KFC_DB_PASSWORD:-kfc}@db:5432/${POSTGRES_DB:-kfc}
+      KFC_CORS_ORIGINS: https://dsquare.larynxai.in
+      KFC_GEMINI_API_KEY: ${KFC_GEMINI_API_KEY:-}
+      KFC_GEMINI_MODEL: ${KFC_GEMINI_MODEL:-gemini-2.0-flash}
+    env_file:
+      - path: .env.prod
+        required: false
+
+  dashboard:
+    restart: unless-stopped
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: https://dsquare.larynxai.in
+    ports:
+      - "127.0.0.1:3100:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: https://dsquare.larynxai.in
+    depends_on:
+      - api
