@@ -114,6 +114,7 @@ class OrderItemIn(BaseModel):
 class OrderCreateRequest(BaseModel):
     model_config = ConfigDict(extra="ignore", populate_by_name=True)
 
+    order_number: str = ""
     customer_name: str = ""
     customer_phone: str = Field(default="", min_length=0, max_length=20)
     email: Optional[str] = ""
@@ -150,6 +151,10 @@ class OrderCreateRequest(BaseModel):
                 stripped[sk] = v
         data = stripped
         aliases = {
+            "order number": "order_number",
+            "order id": "order_number",
+            "order_id": "order_number",
+            "ordernumber": "order_number",
             "customer phone number": "customer_phone",
             "phone number": "customer_phone",
             "phone": "customer_phone",
@@ -229,7 +234,7 @@ class OrderCreateRequest(BaseModel):
                      "pickup_time", "delivery_address", "payment_method",
                      "call_id", "workflow_run_id", "first_name", "rsvp",
                      "recording_url", "user_recording_url", "bot_recording_url",
-                     "transcript_url", mode="before")
+                     "transcript_url", "order_number", mode="before")
     @classmethod
     def _coerce_str_fields(cls, v: Any) -> Any:
         if v is None:

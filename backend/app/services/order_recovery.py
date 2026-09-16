@@ -12,6 +12,7 @@ Runs on EVERY post-call webhook (not only on missing data):
 """
 
 import json
+import re
 import secrets
 from decimal import Decimal
 
@@ -40,6 +41,28 @@ _ORDER_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 def _gen_order_number() -> str:
     return f"PB-{''.join(secrets.choice(_ORDER_CODE_ALPHABET) for _ in range(3))}"
 
+
+def _extract_order_number_from_text(text: str) -> str:
+    """Regex fallback when the LLM returns no order_number.
+
+    Picks up PB-XXX codes and generic 'order (number|id|#) <code>' mentions
+    straight from the transcript so we never invent an ID.
+    """
+    if not text:
+        return ""
+    m = re.search(r"\bPB-[A-Z0-9]{3,10}\b", text, re.IGNORECASE)
+    if m:
+        return m.group(0).upper().strip()
+    m = re.search(
+        r"order\s*(?:number|no\.?|id|#)?\s*(?:is|:)?\s*([A-Z0-9][A-Z0-9\-]{2,30})",
+        text, re.IGNORECASE,
+    )
+    if m:
+        cand = m.group(1).strip().strip(".,;:!?\"'").upper()
+        if cand and cand not in {"IS", "THE", "A", "AN"}:
+            return cand
+    return ""
+
 MENU = """PIZZAS (Small / Medium / Large) — crust Regular or Thin at no extra charge:
 - Margherita Pizza (Veg): 8.99 / 11.99 / 14.99
 - Pepperoni Pizza (Non-Veg): 9.99 / 12.99 / 15.99
@@ -54,6 +77,7 @@ DESSERTS: Chocolate Brownie 4.49, Choco Lava Cake 4.99"""
 _PROMPT = """You extract a restaurant order from a phone-call transcript.
 Return ONLY valid JSON, no markdown, no explanation, with exactly these keys:
 {
+  "order_number": "order ID / order number as spoken in the call (e.g. PB-ABC, ORD-123). Copy it EXACTLY as heard, else empty string — do NOT invent one",
   "customer_name": "full name or empty string",
   "customer_phone": "digits only, include + and country code if heard, else empty string",
   "order_type": "takeaway or dinein ONLY - delivery, pickup, takeaway and takeout all mean takeaway; use dinein only for eat-in/table service",
@@ -283,7 +307,11 @@ async def create_order_from_transcript(
     note: str = "Order extracted from transcript via Google LLM",
 ):
     """Build a FULL order row straight from transcript text. Returns the
-    Order or None (no transcript / no key / no order found / bad JSON)."""
+    Order or None (no transcript / no key / no order found / bad JSON).
+
+    The order_number comes from the transcript (LLM-extracted, regex fallback)
+    — it is NEVER generated here. Returns None when no order ID is heard.
+    """
     from app.schemas import clean_str as _clean
     api_key, model, enabled = await get_google_key(db)
     if not enabled or not api_key or not (text or "").strip():
@@ -294,14 +322,20 @@ async def create_order_from_transcript(
 
     items, total, _fee = _finalize_items(req, _clean(req.delivery_address))
 
-    order_number = _gen_order_number()
-    for _ in range(10):  # 3-char space is small — retry on (unlikely) collision
-        exists = (
-            await db.execute(select(Order.id).where(Order.order_number == order_number))
-        ).scalar_one_or_none()
-        if exists is None:
-            break
-        order_number = _gen_order_number()
+    order_number = (_clean(req.order_number) or "").strip().upper()
+    if not order_number:
+        order_number = _extract_order_number_from_text(text)
+    if not order_number:
+        logger.warning("order_recovery: no order_number in transcript, skipping save")
+        return None
+
+    # Reuse the row if this transcript order ID was already saved (idempotent).
+    existing_order = (
+        await db.execute(select(Order).where(Order.order_number == order_number))
+    ).scalar_one_or_none()
+    if existing_order is not None:
+        logger.info(f"order_recovery: order {order_number!r} already exists, reusing")
+        return existing_order
 
     order = Order(
         order_number=order_number,
