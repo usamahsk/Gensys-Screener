@@ -15,11 +15,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import get_db
-from app.models import Call, Customer, DograhSetting, GoogleSetting, Memory, Order, OrderEvent, OrderItem
+from app.models import Call, Customer, DograhSetting, GoogleSetting, LangfuseSetting, Memory, Order, OrderEvent, OrderItem
 from app.services import dograh_client
 
 router = APIRouter(prefix="/api/integration/dograh", tags=["integration"])
 google_router = APIRouter(prefix="/api/integration/google", tags=["integration"])
+langfuse_router = APIRouter(prefix="/api/integration/langfuse", tags=["integration"])
 
 DEFAULT_BASE_URL = dograh_client.DEFAULT_BASE_URL
 
@@ -530,3 +531,161 @@ async def recover_call_order(call_id: str):
     """Manually trigger transcript recovery for one call (dashboard retry button)."""
     from app.services.order_recovery import recover_order_from_call
     return await recover_order_from_call(call_id)
+
+
+# ---------- Langfuse observability (org-level key trio + per-run deep links) ----------
+
+LANGFUSE_DEFAULT_HOST = "https://cloud.langfuse.com"
+
+
+class LangfuseSettingRequest(BaseModel):
+    public_key: Optional[str] = None
+    secret_key: Optional[str] = None
+    host: Optional[str] = None
+    project_id: Optional[str] = None
+    enabled: Optional[bool] = None
+
+
+class LangfuseSettingResponse(BaseModel):
+    host: str
+    project_id: str = ""
+    public_key_masked: str = ""
+    has_keys: bool = False
+    enabled: bool = True
+    dograh_pushed: Optional[bool] = None
+    dograh_detail: Optional[str] = None
+
+
+async def _get_langfuse(db: AsyncSession) -> LangfuseSetting:
+    row = (await db.execute(select(LangfuseSetting).where(LangfuseSetting.id == 1))).scalar_one_or_none()
+    if not row:
+        row = LangfuseSetting(id=1, public_key="", secret_key="", host=LANGFUSE_DEFAULT_HOST)
+        db.add(row)
+        await db.flush()
+    return row
+
+
+def _trace_url(host: str, project_id: str, trace_id: str) -> str:
+    base = (host or LANGFUSE_DEFAULT_HOST).rstrip("/")
+    tid = (trace_id or "").strip()
+    if project_id.strip():
+        return f"{base}/project/{project_id.strip()}/traces/{tid}"
+    return f"{base}/traces/{tid}"
+
+
+def _trace_id_from_detail(detail: dict) -> str:
+    """Prefer an explicit trace id/url Dograh returns, else fall back to the run id."""
+    for key in ("langfuse_trace_url", "langfuse_url", "trace_url"):
+        v = detail.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    for scope in (detail, detail.get("logs") or {}, detail.get("gathered_context") or {}):
+        if isinstance(scope, dict):
+            for key in ("langfuse_trace_id", "langfuse_trace", "trace_id", "langfuseTraceId"):
+                v = scope.get(key)
+                if isinstance(v, str) and v.strip():
+                    return v.strip()
+    for key in ("run_id", "id"):
+        v = detail.get(key)
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+@langfuse_router.get("", response_model=LangfuseSettingResponse)
+async def get_langfuse_setting(db: AsyncSession = Depends(get_db)):
+    s = await _get_langfuse(db)
+    return LangfuseSettingResponse(
+        host=s.host or LANGFUSE_DEFAULT_HOST,
+        project_id=s.project_id or "",
+        public_key_masked=_mask(s.public_key),
+        has_keys=bool(s.public_key and s.secret_key),
+        enabled=s.enabled,
+    )
+
+
+@langfuse_router.put("", response_model=LangfuseSettingResponse)
+async def update_langfuse_setting(req: LangfuseSettingRequest, db: AsyncSession = Depends(get_db)):
+    """Save the Langfuse trio locally AND push it to the Dograh org config.
+
+    Local save always wins; the Dograh push is best-effort (reported via
+    dograh_pushed/dograh_detail) so a Dograh field-name drift never blocks save.
+    """
+    s = await _get_langfuse(db)
+    if req.public_key:
+        s.public_key = req.public_key.strip()
+    if req.secret_key:
+        s.secret_key = req.secret_key.strip()
+    if req.host is not None and req.host.strip():
+        s.host = req.host.strip().rstrip("/")
+    if req.project_id is not None:
+        s.project_id = req.project_id.strip()
+    if req.enabled is not None:
+        s.enabled = req.enabled
+    await db.commit()
+    await db.refresh(s)
+
+    pushed: Optional[bool] = None
+    detail_msg: Optional[str] = None
+    if s.public_key and s.secret_key:
+        d = await _get_setting(db)
+        if d.api_key:
+            try:
+                res = await dograh_client.push_langfuse_config(
+                    d.api_key, d.base_url, s.public_key, s.secret_key, s.host)
+                pushed = bool(res.get("pushed"))
+                detail_msg = str(res.get("detail") or "")
+            except Exception as e:
+                pushed = False
+                detail_msg = f"push failed: {e}"
+        else:
+            pushed = False
+            detail_msg = "saved locally; no Dograh API key configured so nothing was pushed"
+    return LangfuseSettingResponse(
+        host=s.host or LANGFUSE_DEFAULT_HOST,
+        project_id=s.project_id or "",
+        public_key_masked=_mask(s.public_key),
+        has_keys=bool(s.public_key and s.secret_key),
+        enabled=s.enabled,
+        dograh_pushed=pushed,
+        dograh_detail=detail_msg,
+    )
+
+
+@langfuse_router.get("/trace-url", response_model=dict)
+async def langfuse_trace_url(
+    run_id: Optional[int] = None,
+    workflow_id: Optional[int] = None,
+    call_id: Optional[str] = None,
+    trace_id: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Deep-link one run/call to its Langfuse trace.
+
+    Priority: explicit ?trace_id= → trace id found in the Dograh run detail →
+    run_id / call_id as the trace id (standard Dograh→Langfuse naming).
+    """
+    s = await _get_langfuse(db)
+    if not s.enabled:
+        raise HTTPException(400, "Langfuse integration is disabled")
+    tid = (trace_id or "").strip()
+    source = "explicit"
+    if not tid and run_id and workflow_id:
+        d = await _get_setting(db)
+        if not d.api_key:
+            raise HTTPException(400, "No voice platform API key configured")
+        try:
+            detail = await dograh_client.get_run_detail(d.api_key, d.base_url, workflow_id, run_id)
+            found = _trace_id_from_detail(detail)
+            if found.startswith("http"):
+                return {"url": found, "trace_id": found, "source": "dograh"}
+            tid = found
+            source = "dograh-run"
+        except Exception as e:
+            raise HTTPException(502, f"Voice platform request failed: {e}")
+    if not tid:
+        tid = str(run_id or "").strip() or (call_id or "").strip()
+        source = "run-id" if run_id else "call-id"
+    if not tid:
+        raise HTTPException(400, "Pass ?trace_id=, ?run_id=&workflow_id=, or ?call_id=")
+    return {"url": _trace_url(s.host, s.project_id or "", tid), "trace_id": tid, "source": source}

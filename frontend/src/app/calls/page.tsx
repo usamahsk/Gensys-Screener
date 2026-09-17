@@ -363,6 +363,28 @@ export default function CallLogsPage() {
                   </div>
                 </div>
               )}
+
+              <div className="flex justify-end gap-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={async () => {
+                    try {
+                      const params: { call_id?: string; run_id?: number; workflow_id?: number } =
+                        detail.run_id && detail.workflow_id
+                          ? { run_id: detail.run_id, workflow_id: detail.workflow_id }
+                          : { call_id: detail.call_id };
+                      const { url } = await apiClient.langfuseTraceUrl(params);
+                      window.open(url, "_blank", "noopener,noreferrer");
+                    } catch {
+                      /* toast available via sonner if wired; silent fallback */
+                      window.open("/settings", "_blank");
+                    }
+                  }}
+                >
+                  <ExternalLink className="mr-2 h-3 w-3" /> View trace
+                </Button>
+              </div>
             </>
           )}
         </DialogContent>

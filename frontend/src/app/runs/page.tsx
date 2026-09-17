@@ -118,6 +118,15 @@ export default function RunsPage() {
     }
   };
 
+  const openTrace = async (r: DograhRun) => {
+    try {
+      const { url } = await apiClient.langfuseTraceUrl({ run_id: r.run_id, workflow_id: r.workflow_id });
+      window.open(url, "_blank", "noopener,noreferrer");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Could not build trace link (check Langfuse settings)");
+    }
+  };
+
   const gc = selected?.gathered_context || {};
 
   const stats = useMemo(() => {
@@ -195,9 +204,14 @@ export default function RunsPage() {
                 <TableCell className="text-sm">{r.charge_usd != null ? `$${r.charge_usd.toFixed(4)}` : "—"}</TableCell>
                 <TableCell className="text-xs text-muted-foreground">{fmtDateTime(r.created_at)}</TableCell>
                 <TableCell>
-                  <Button size="sm" variant="outline" onClick={(e) => { e.stopPropagation(); importRun(r); }}>
-                    <Import className="mr-1 h-3 w-3" /> Import
-                  </Button>
+                  <div className="flex gap-1">
+                    <Button size="sm" variant="outline" onClick={(e) => { e.stopPropagation(); importRun(r); }}>
+                      <Import className="mr-1 h-3 w-3" /> Import
+                    </Button>
+                    <Button size="sm" variant="ghost" title="Open Langfuse trace" onClick={(e) => { e.stopPropagation(); openTrace(r); }}>
+                      <ExternalLink className="h-3 w-3" />
+                    </Button>
+                  </div>
                 </TableCell>
               </TableRow>
             ))}
@@ -270,6 +284,9 @@ export default function RunsPage() {
 
               <div className="flex justify-end gap-2">
                 <Button variant="outline" onClick={() => setSelected(null)}>Close</Button>
+                <Button variant="outline" onClick={() => selected && openTrace(selected)}>
+                  <ExternalLink className="mr-2 h-4 w-4" /> View trace
+                </Button>
                 <Button onClick={() => importRun(selected)}>
                   {loading ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Import className="mr-2 h-4 w-4" />}
                   Import run

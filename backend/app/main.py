@@ -49,6 +49,7 @@ app.include_router(orders.router)
 app.include_router(calls.router)
 app.include_router(integration.router)
 app.include_router(integration.google_router)
+app.include_router(integration.langfuse_router)
 app.include_router(analytics.router)
 
 

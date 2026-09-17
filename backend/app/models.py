@@ -212,3 +212,23 @@ class GoogleSetting(Base):
     recovery_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     use_audio: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class LangfuseSetting(Base):
+    """Single-row (id=1) Langfuse observability config, managed from the dashboard.
+
+    Org-level: one key trio for the whole Dograh instance. Saved locally and
+    pushed to the Dograh org model-config so traces keep flowing without
+    opening Dograh. The dashboard then deep-links each run/call to its
+    Langfuse trace.
+    """
+
+    __tablename__ = "langfuse_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    public_key: Mapped[str] = mapped_column(Text, default="")
+    secret_key: Mapped[str] = mapped_column(Text, default="")
+    host: Mapped[str] = mapped_column(String(256), default="https://cloud.langfuse.com")
+    project_id: Mapped[str] = mapped_column(String(128), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

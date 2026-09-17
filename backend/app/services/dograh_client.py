@@ -183,3 +183,43 @@ async def save_model_config(api_key: str, base_url: str, payload: dict[str, Any]
             headers={"X-API-Key": api_key, "Content-Type": "application/json"},
         )
         return {"status": r.status_code, "body": r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text[:1000]}
+
+
+async def push_langfuse_config(
+    api_key: str, base_url: str, public_key: str, secret_key: str, host: str,
+) -> dict[str, Any]:
+    """Push the Langfuse key trio into the Dograh org config (best-effort).
+
+    Merges into the live org model-config so unrelated keys are preserved.
+    Dograh versions differ on the exact field names, so the trio is written
+    under the standard `langfuse` block plus common flat aliases.
+    Returns {"pushed": bool, "detail": str}.
+    """
+    try:
+        current = await get_model_config(api_key, base_url)
+    except Exception as e:
+        return {"pushed": False, "detail": f"read current config failed: {e}"}
+    cfg = current.get("effective_configuration") or current.get("configuration") or {}
+    if not isinstance(cfg, dict):
+        cfg = {}
+    merged: dict[str, Any] = dict(cfg)
+    langfuse_block = dict(merged.get("langfuse") or {})
+    langfuse_block.update({
+        "public_key": public_key,
+        "secret_key": secret_key,
+        "host": host or "https://cloud.langfuse.com",
+        "enabled": True,
+    })
+    merged["langfuse"] = langfuse_block
+    # flat aliases for Dograh variants that read top-level keys
+    merged["langfuse_public_key"] = public_key
+    merged["langfuse_secret_key"] = secret_key
+    merged["langfuse_host"] = host or "https://cloud.langfuse.com"
+    try:
+        result = await save_model_config(api_key, base_url, merged)
+    except Exception as e:
+        return {"pushed": False, "detail": f"write failed: {e}"}
+    status = result.get("status", 0)
+    if isinstance(status, int) and status < 400:
+        return {"pushed": True, "detail": "saved to Dograh org config"}
+    return {"pushed": False, "detail": f"Dograh rejected ({status}): {str(result.get('body'))[:200]}"}

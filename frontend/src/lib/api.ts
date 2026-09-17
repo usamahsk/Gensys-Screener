@@ -107,6 +107,16 @@ export interface GoogleSetting {
   use_audio: boolean;
 }
 
+export interface LangfuseSetting {
+  host: string;
+  project_id: string;
+  public_key_masked: string;
+  has_keys: boolean;
+  enabled: boolean;
+  dograh_pushed?: boolean | null;
+  dograh_detail?: string | null;
+}
+
 export interface DograhRun {
   run_id: number;
   workflow_id: number;
@@ -169,6 +179,20 @@ export const apiClient = {
       method: "PUT",
       body: JSON.stringify(s),
     }),
+  langfuseSetting: () => api<LangfuseSetting>("/api/integration/langfuse"),
+  saveLangfuseSetting: (s: { public_key?: string; secret_key?: string; host?: string; project_id?: string; enabled?: boolean }) =>
+    api<LangfuseSetting>("/api/integration/langfuse", {
+      method: "PUT",
+      body: JSON.stringify(s),
+    }),
+  langfuseTraceUrl: (params: { run_id?: number; workflow_id?: number; call_id?: string; trace_id?: string }) => {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v !== undefined && v !== "") as [string, string][]
+    );
+    return api<{ url: string; trace_id: string; source: string }>(
+      `/api/integration/langfuse/trace-url?${qs}`
+    );
+  },
   recoverCallOrder: (callId: string) =>
     api<{ status: string; order_number?: string; reason?: string }>(`/api/integration/google/recover/${encodeURIComponent(callId)}`, {
       method: "POST",
