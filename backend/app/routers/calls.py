@@ -33,6 +33,9 @@ async def list_calls(
             | Call.customer_phone.ilike(like)
             | Call.call_id.ilike(like)
             | Call.first_name.ilike(like)
+            | Call.provider_call_id.ilike(like)
+            | Call.provider.ilike(like)
+            | Call.genesys_conversation_id.ilike(like)
         )
     rows = (await db.execute(q)).scalars().all()
     return [
@@ -52,6 +55,8 @@ async def list_calls(
             "sentiment": c.sentiment,
             "recording_url": c.recording_url or "",
             "transcript_url": c.transcript_url or "",
+            "provider": c.provider or "dograh",
+            "provider_call_id": c.provider_call_id or "",
         }
         for c in rows
     ]
@@ -85,6 +90,8 @@ async def call_detail(call_id: str, db: AsyncSession = Depends(get_db)):
         "user_recording_url": c.user_recording_url,
         "bot_recording_url": c.bot_recording_url,
         "genesys_conversation_id": c.genesys_conversation_id,
+        "provider": c.provider or "dograh",
+        "provider_call_id": c.provider_call_id or "",
         "workflow_id": c.workflow_id,
         "run_id": c.run_id,
         "workflow_name": c.workflow_name,

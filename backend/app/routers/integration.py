@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -69,6 +69,11 @@ class DograhRun(BaseModel):
     transcript_public_url: Optional[str] = None
     recording_public_url: Optional[str] = None
     gathered_context: Optional[dict] = None
+    # Telephony channel + provider-side call id surfaced from the run payload
+    provider: Optional[str] = None
+    provider_call_id: Optional[str] = None
+    caller_number: Optional[str] = None
+    called_number: Optional[str] = None
 
 
 async def _get_setting(db: AsyncSession) -> DograhSetting:
@@ -169,6 +174,7 @@ async def list_dograh_runs(
 
     runs = []
     for r in data.get("runs", []):
+        tele = _extract_telephony(r)
         runs.append(DograhRun(
             run_id=r.get("id"), workflow_id=r.get("workflow_id"),
             workflow_name=r.get("workflow_name"), name=r.get("name"),
@@ -185,6 +191,10 @@ async def list_dograh_runs(
             transcript_public_url=r.get("transcript_public_url"),
             recording_public_url=r.get("recording_public_url"),
             gathered_context=r.get("gathered_context"),
+            provider=tele["provider"],
+            provider_call_id=tele["provider_call_id"],
+            caller_number=tele["caller_number"],
+            called_number=tele["called_number"],
         ))
     return {
         "runs": [r.model_dump() for r in runs],
@@ -241,9 +251,10 @@ async def run_transcript(
 
 
 @router.get("/file")
-async def proxy_dograh_file(url: str, db: AsyncSession = Depends(get_db)):
+async def proxy_dograh_file(url: str, download: bool = False, db: AsyncSession = Depends(get_db)):
     """Stream a voice platform recording/transcript file through our backend so the
-    browser can play it without touching the voice platform/storage directly."""
+    browser can play it without touching the voice platform/storage directly.
+    Pass ?download=1 to force a file download (Content-Disposition)."""
     from fastapi.responses import StreamingResponse
 
     s = await _get_setting(db)
@@ -252,7 +263,8 @@ async def proxy_dograh_file(url: str, db: AsyncSession = Depends(get_db)):
     data, content_type = await dograh_client.fetch_public_bytes(url, s.base_url)
     if not data:
         raise HTTPException(502, "Could not fetch file from voice platform storage")
-    return StreamingResponse(iter([data]), media_type=content_type)
+    headers = {"Content-Disposition": 'attachment; filename="recording"'} if download else {}
+    return StreamingResponse(iter([data]), media_type=content_type, headers=headers)
 
 
 @router.get("/runs/by-call-id/{call_uuid}", response_model=dict)
@@ -318,7 +330,18 @@ async def import_run(
 
     logs = detail.get("logs") or {}
     audiohook = logs.get("audiohook") or {}
-    genesys_conv = audiohook.get("correlation_id") or audiohook.get("session_id") or ""
+    # Genesys AudioHook open request carries session + conversation ids;
+    # prefer the true conversation id, fall back to correlation/session.
+    genesys_conv = (
+        audiohook.get("conversation_id") or audiohook.get("conversationId")
+        or audiohook.get("correlation_id") or audiohook.get("session_id") or ""
+    )
+
+    tele = _extract_telephony(detail)
+    provider_call_id = tele["provider_call_id"]
+    # Genesys-flavoured alias mirrors the generic id when provider is Genesys.
+    if tele["provider"] == "genesys" and provider_call_id:
+        genesys_conv = genesys_conv or provider_call_id
 
     disposition = _map_disposition(gc)
     duration = int(detail.get("duration_seconds") or (detail.get("usage_info") or {}).get("call_duration_seconds") or 0)
@@ -347,6 +370,8 @@ async def import_run(
         user_recording_url=detail.get("user_recording_public_url") or "",
         bot_recording_url=detail.get("bot_recording_public_url") or "",
         genesys_conversation_id=genesys_conv,
+        provider=tele["provider"] or "dograh",
+        provider_call_id=provider_call_id or "",
         workflow_id=workflow_id,
         run_id=run_id,
         workflow_name=detail.get("workflow_name") or "",
@@ -367,10 +392,97 @@ async def import_run(
         db.add(Memory(customer_id=cust.id, kind="call_summary", text=summary, embedding=vec))
 
     if gc.get("order_number"):
-        await _import_order(db, gc, customer_name, phone, call_id)
+        await _import_order(db, gc, customer_name, phone, call_id,
+                            provider=tele["provider"] or "dograh",
+                            provider_call_id=provider_call_id or "")
 
     await db.commit()
     return {"status": "imported", "call_id": call_id, "disposition": disposition}
+
+
+TELEPHONY_ID_KEYS = (
+    "provider_call_id", "telephony_id", "telephony_call_id", "call_sid",
+    "telephony_call_sid", "twilio_sid", "twilio_call_sid", "vonage_uuid",
+    "plivo_call_uuid", "telnyx_call_id", "call_uuid", "external_call_id",
+    "provider_call_sid", "sip_call_id",
+    # Genesys AudioHook ids (conversation id preferred over session)
+    "conversation_id", "conversationId", "session_id", "correlation_id",
+    # Last resort: Dograh often stores the provider-side session UUID under
+    # gathered_context.call_id (e.g. Genesys AudioHook session id).
+    "call_id",
+)
+
+
+def _extract_telephony(detail: dict) -> dict:
+    """Pull provider/channel + provider-side telephony id out of a Dograh run.
+
+    Dograh keeps the PSTN identifiers (Twilio/Vonage/Plivo/Telnyx Call SIDs)
+    inside initial_context / gathered_context / logs rather than top-level,
+    and reports the channel via mode / call_channel / callChannel.
+    Everything is optional — missing values come back as "".
+    """
+    scopes: list[dict] = []
+    _logs: dict = {}
+    for key in ("initial_context", "gathered_context", "logs", "usage_info",
+                "cost_info", "annotations"):
+        v = detail.get(key)
+        if isinstance(v, dict):
+            scopes.append(v)
+            if key == "logs":
+                _logs = v
+    # Genesys AudioHook session/conversation ids live nested under logs.
+    _audiohook = _logs.get("audiohook")
+    if isinstance(_audiohook, dict):
+        scopes.append(_audiohook)
+    scopes.append(detail if isinstance(detail, dict) else {})
+
+    provider_call_id = ""
+    for scope in scopes:
+        for k in TELEPHONY_ID_KEYS:
+            v = scope.get(k)
+            if isinstance(v, str) and v.strip() and "{{" not in v:
+                provider_call_id = v.strip()[:128]
+                break
+        if provider_call_id:
+            break
+
+    provider = ""
+    for scope in scopes:
+        for k in ("provider", "telephony_provider", "call_provider"):
+            v = scope.get(k)
+            if isinstance(v, str) and v.strip():
+                provider = v.strip().lower()[:32]
+                break
+        if provider:
+            break
+    if not provider:
+        # channel hints: telephony | web | chat
+        for scope in scopes:
+            for k in ("call_channel", "callChannel", "channel", "mode"):
+                v = scope.get(k)
+                if isinstance(v, str) and v.strip().lower() in (
+                        "telephony", "web", "chat", "sip"):
+                    provider = "dograh-" + v.strip().lower()
+                    break
+            if provider:
+                break
+    if not provider:
+        provider = "dograh"
+
+    def _num(scope_key_candidates: tuple[str, ...]) -> str:
+        for scope in scopes:
+            for k in scope_key_candidates:
+                v = scope.get(k)
+                if isinstance(v, str) and v.strip() and "{{" not in v:
+                    return v.strip()[:32]
+        return ""
+
+    return {
+        "provider": provider,
+        "provider_call_id": provider_call_id,
+        "caller_number": _num(("caller_number", "callerNumber", "from_number", "from")),
+        "called_number": _num(("called_number", "calledNumber", "to_number", "to")),
+    }
 
 
 def _turns_and_tools_from_events(detail: dict) -> tuple[list[dict], list[dict]]:
@@ -448,7 +560,8 @@ def _summary_from_gathered(gc: dict, disposition: str) -> str:
     return " ".join(parts)
 
 
-async def _import_order(db: AsyncSession, gc: dict, customer_name: str, phone: str, call_id: str):
+async def _import_order(db: AsyncSession, gc: dict, customer_name: str, phone: str, call_id: str,
+                      provider: str = "dograh", provider_call_id: str = ""):
     order_number = gc["order_number"]
     order = (await db.execute(select(Order).where(Order.order_number == order_number))).scalar_one_or_none()
     order_type = "takeaway"
@@ -459,11 +572,15 @@ async def _import_order(db: AsyncSession, gc: dict, customer_name: str, phone: s
     if order:
         order.total = total if total else order.total
         order.status = "confirmed"
+        if not order.provider_call_id and provider_call_id:
+            order.provider = provider
+            order.provider_call_id = provider_call_id
         return
     order = Order(
         order_number=order_number, customer_name=customer_name, customer_phone=phone,
         email=gc.get("customer_email") or "", order_type=order_type,
         status="confirmed", total=total, source="voice_agent", call_id=call_id,
+        provider=provider, provider_call_id=provider_call_id,
     )
     db.add(order)
     await db.flush()
@@ -689,3 +806,86 @@ async def langfuse_trace_url(
     if not tid:
         raise HTTPException(400, "Pass ?trace_id=, ?run_id=&workflow_id=, or ?call_id=")
     return {"url": _trace_url(s.host, s.project_id or "", tid), "trace_id": tid, "source": source}
+
+
+# ---------- Knowledge base (Dograh org documents) ----------
+
+KB_ALLOWED_EXTS = {".pdf", ".docx", ".doc", ".txt", ".json"}
+KB_MAX_BYTES = 5 * 1024 * 1024
+
+KB_MIME_BY_EXT = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+    ".txt": "text/plain",
+    ".json": "application/json",
+}
+
+
+@router.get("/knowledge-base", response_model=dict)
+async def list_kb_documents(
+    status: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    db: AsyncSession = Depends(get_db),
+):
+    """List Dograh knowledge-base documents for this org (proxied)."""
+    s = await _get_setting(db)
+    if not s.api_key:
+        raise HTTPException(400, "No voice platform API key configured")
+    try:
+        return await dograh_client.list_kb_documents(
+            s.api_key, s.base_url, status=status, limit=limit, offset=offset)
+    except Exception as e:
+        raise HTTPException(502, f"Voice platform request failed: {e}")
+
+
+@router.post("/knowledge-base/upload", response_model=dict)
+async def upload_kb_document(
+    file: UploadFile = File(...),
+    retrieval_mode: str = Form(default="chunked"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload a file (PDF/DOCX/TXT/JSON, ≤5 MB) to the Dograh knowledge base.
+
+    Flow: presigned URL → PUT bytes → process-document (chunking+embedding).
+    Returns the Dograh document record (processing continues in background).
+    """
+    s = await _get_setting(db)
+    if not s.api_key:
+        raise HTTPException(400, "No voice platform API key configured")
+    import os as _os
+    filename = (file.filename or "document").strip() or "document"
+    ext = _os.path.splitext(filename)[1].lower()
+    if ext not in KB_ALLOWED_EXTS:
+        raise HTTPException(
+            400, f"Unsupported file type {ext or '(none)'} — use PDF, DOCX, TXT or JSON")
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Empty file")
+    if len(data) > KB_MAX_BYTES:
+        raise HTTPException(400, "File too large — Dograh limit is 5 MB")
+    mime = file.content_type or KB_MIME_BY_EXT[ext]
+    mode = retrieval_mode if retrieval_mode in ("chunked", "full_document") else "chunked"
+    try:
+        up = await dograh_client.get_kb_upload_url(s.api_key, s.base_url, filename, mime)
+        await dograh_client.put_bytes_to_presigned_url(up["upload_url"], data, mime)
+        doc = await dograh_client.process_kb_document(
+            s.api_key, s.base_url, up["document_uuid"], up["s3_key"], mode)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(502, f"Voice platform request failed: {e}")
+    return {"status": "uploaded", "retrieval_mode": mode, "document": doc}
+
+
+@router.delete("/knowledge-base/{document_uuid}", response_model=dict)
+async def delete_kb_document(document_uuid: str, db: AsyncSession = Depends(get_db)):
+    s = await _get_setting(db)
+    if not s.api_key:
+        raise HTTPException(400, "No voice platform API key configured")
+    try:
+        await dograh_client.delete_kb_document(s.api_key, s.base_url, document_uuid)
+    except Exception as e:
+        raise HTTPException(502, f"Voice platform request failed: {e}")
+    return {"status": "deleted", "document_uuid": document_uuid}

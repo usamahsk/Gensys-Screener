@@ -45,6 +45,9 @@ export interface OrderRow {
   source: string;
   item_count: number;
   created_at: string;
+  provider: string;
+  provider_call_id: string;
+  call_id: string;
 }
 
 export interface OrderDetail extends OrderRow {
@@ -70,6 +73,8 @@ export interface CallRow {
   sentiment: string;
   recording_url: string;
   transcript_url: string;
+  provider: string;
+  provider_call_id: string;
 }
 
 export interface TranscriptTurn {
@@ -91,6 +96,52 @@ export interface CallDetail extends CallRow {
   run_id: number | null;
   workflow_name: string;
   call_type: string;
+}
+
+export interface TransactionCall extends CallRow {
+  genesys_conversation_id: string;
+  run_id: number | null;
+  workflow_id: number | null;
+  workflow_name: string;
+}
+
+export interface TransactionRow {
+  key: string;
+  started_at: string;
+  call: TransactionCall | null;
+  orders: OrderRow[];
+}
+
+export interface TelephonyUIField {
+  name: string;
+  label: string;
+  type: string;
+  required: boolean;
+  sensitive: boolean;
+  description: string | null;
+  placeholder: string | null;
+}
+
+export interface TelephonyProviderMeta {
+  provider: string;
+  display_name: string;
+  connectivity: string;
+  fields: TelephonyUIField[];
+  docs_url: string | null;
+}
+
+export interface KnowledgeDocument {
+  id: number;
+  document_uuid: string;
+  filename: string;
+  file_size_bytes: number;
+  mime_type: string;
+  processing_status: string;
+  processing_error: string | null;
+  total_chunks: number;
+  retrieval_mode: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface DograhSetting {
@@ -131,6 +182,10 @@ export interface DograhRun {
   transcript_public_url: string | null;
   recording_public_url: string | null;
   gathered_context: Record<string, unknown> | null;
+  provider: string | null;
+  provider_call_id: string | null;
+  caller_number: string | null;
+  called_number: string | null;
 }
 
 export interface Analytics {
@@ -236,6 +291,104 @@ export const apiClient = {
     return api<CallRow[]>(`/api/calls${suffix}`);
   },
   callDetail: (callId: string) => api<CallDetail>(`/api/calls/${callId}`),
+  transactions: (params?: { disposition?: string; search?: string }) => {
+    const qs = new URLSearchParams(
+      Object.entries(params || {}).filter(([, v]) => v) as [string, string][]
+    );
+    const suffix = qs.toString() ? `?${qs}` : "";
+    return api<{ transactions: TransactionRow[]; total: number }>(`/api/transactions${suffix}`);
+  },
+  backfillProviderIds: () =>
+    api<{ updated_calls: number; updated_orders: number; runs_scanned: number }>(
+      "/api/transactions/backfill-provider-ids",
+      { method: "POST" }
+    ),
+  telephonyProviders: () =>
+    api<{ providers: TelephonyProviderMeta[] }>(
+      "/api/integration/dograh/telephony/providers"
+    ),
+  telephonyWarnings: () => api<Record<string, unknown>>("/api/integration/dograh/telephony/warnings"),
+  telephonyConfigs: () => api<Record<string, unknown>>("/api/integration/dograh/telephony/configs"),
+  createTelephonyConfig: (body: { name: string; provider: string; credentials: Record<string, string>; is_default_outbound?: boolean }) =>
+    api<Record<string, unknown>>("/api/integration/dograh/telephony/configs", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateTelephonyConfig: (id: number, body: { name?: string; credentials?: Record<string, string> }) =>
+    api<Record<string, unknown>>(`/api/integration/dograh/telephony/configs/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  deleteTelephonyConfig: (id: number) =>
+    api<Record<string, unknown>>(`/api/integration/dograh/telephony/configs/${id}`, {
+      method: "DELETE",
+    }),
+  setDefaultOutbound: (id: number) =>
+    api<Record<string, unknown>>(
+      `/api/integration/dograh/telephony/configs/${id}/set-default-outbound`,
+      { method: "POST" }
+    ),
+  reactivateTelephonyConfig: (id: number) =>
+    api<Record<string, unknown>>(
+      `/api/integration/dograh/telephony/configs/${id}/reactivate`,
+      { method: "POST" }
+    ),
+  telephonyNumbers: (id: number) =>
+    api<Record<string, unknown>>(`/api/integration/dograh/telephony/configs/${id}/numbers`),
+  addTelephonyNumber: (id: number, body: Record<string, unknown>) =>
+    api<Record<string, unknown>>(`/api/integration/dograh/telephony/configs/${id}/numbers`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateTelephonyNumber: (id: number, nid: number, body: Record<string, unknown>) =>
+    api<Record<string, unknown>>(
+      `/api/integration/dograh/telephony/configs/${id}/numbers/${nid}`,
+      { method: "PUT", body: JSON.stringify(body) }
+    ),
+  deleteTelephonyNumber: (id: number, nid: number) =>
+    api<Record<string, unknown>>(
+      `/api/integration/dograh/telephony/configs/${id}/numbers/${nid}`,
+      { method: "DELETE" }
+    ),
+  setDefaultCaller: (id: number, nid: number) =>
+    api<Record<string, unknown>>(
+      `/api/integration/dograh/telephony/configs/${id}/numbers/${nid}/set-default-caller`,
+      { method: "POST" }
+    ),
+  knowledgeDocs: () =>
+    api<{ documents: KnowledgeDocument[]; total: number }>(
+      "/api/integration/dograh/knowledge-base"
+    ),
+  deleteKnowledgeDoc: (uuid: string) =>
+    api<{ status: string }>(
+      `/api/integration/dograh/knowledge-base/${encodeURIComponent(uuid)}`,
+      { method: "DELETE" }
+    ),
+  uploadKnowledgeDoc: async (file: File, retrievalMode = "chunked") => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("retrieval_mode", retrievalMode);
+    const res = await fetch(
+      `${API_URL}/api/integration/dograh/knowledge-base/upload`,
+      { method: "POST", body: form, cache: "no-store" }
+    );
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`${res.status} ${res.statusText}: ${body.slice(0, 300)}`);
+    }
+    return res.json() as Promise<Record<string, unknown>>;
+  },
+  reportDownloadUrl: (params: {
+    report: string;
+    format?: string;
+    start_date?: string;
+    end_date?: string;
+  }) => {
+    const qs = new URLSearchParams(
+      Object.entries(params).filter(([, v]) => v) as [string, string][]
+    );
+    return `${API_URL}/api/reports/download?${qs}`;
+  },
 };
 
 export function fmtDuration(s: number) {

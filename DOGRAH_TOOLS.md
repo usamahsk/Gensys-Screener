@@ -40,6 +40,8 @@ Parameters:
 | items          | array  | yes      | **Recorded verbatim — no menu validation.** Each entry {name: string, quantity: number, unit_price: number, size?: string, notes?: string}. Send the dish name as heard plus the price you quoted. Aliases accepted: `price` = unit_price, `item`/`dish`/`product` = name. |
 | total          | number | no       | Order total fallback, used only when items carry no prices |
 | call_id        | string | no       | Preset parameter `{{workflow_run_id}}` (see note below) |
+| provider       | string | no       | Preset `dograh` (or `genesys`) — stored as the provider column |
+| provider_call_id | string | no     | Preset telephony/SIP Call SID from your telephony provider (Twilio/Vonage/Plivo/Telnyx) — stored as the telephony ID, the Dograh flavour of the Genesys conversation id. Aliases accepted: `telephony_id`, `telephony_call_id`, `call_sid` |
 | first_name     | string | no       | Preset `{{initial_context.first_name}}` — stored on the call log |
 | rsvp           | string | no       | Preset `{{gathered_context.rsvp}}` — stored on the call log |
 | duration       | number | no       | Preset `{{cost_info.call_duration_seconds}}` — stored on the call log |
@@ -68,6 +70,8 @@ Sample request (all fields):
     { "name": "Coke Large", "quantity": 1, "unit_price": 99, "size": "Large" }
   ],
   "call_id": "{{workflow_run_id}}",
+  "provider": "dograh",
+  "provider_call_id": "{{initial_context.telephony_call_id}}",
   "first_name": "{{initial_context.first_name}}",
   "rsvp": "{{gathered_context.rsvp}}",
   "duration": "{{cost_info.call_duration_seconds}}",
@@ -77,6 +81,14 @@ Sample request (all fields):
   "transcript_url": "{{transcript_url}}"
 }
 ```
+
+> **Telephony ID:** `provider_call_id` accepts any provider-side call SID
+> (Twilio/Vonage/Plivo/Telnyx). If your telephony setup exposes it under a
+> different context key, point the preset at that key instead — e.g.
+> `{{initial_context.call_sid}}`. Aliases `telephony_id`, `telephony_call_id`,
+> `call_sid` all work. This is the Dograh equivalent of the Genesys
+> conversation id, and it shows up as **Provider / Telephony ID** columns in
+> Runs, Orders and Call Logs, plus the Excel reports.
 
 Sample response (201):
 ```json
@@ -179,6 +191,8 @@ Response: `201` with the stored memory object.
 ```json
 {
   "call_id": "{{workflow_run_id}}",
+  "provider": "dograh",
+  "provider_call_id": "{{initial_context.telephony_call_id}}",
   "first_name": "{{initial_context.first_name}}",
   "rsvp": "{{gathered_context.rsvp}}",
   "duration": "{{cost_info.call_duration_seconds}}",

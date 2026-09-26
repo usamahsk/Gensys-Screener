@@ -49,7 +49,7 @@ export default function OverviewPage() {
         { title: "AI Resolved", value: analytics.ai_resolved, icon: CheckCheck },
         { title: "Transferred", value: analytics.transferred, icon: ArrowLeftRight },
         { title: "Failed / Abandoned", value: analytics.failed, icon: TriangleAlert },
-        { title: "Orders Created", value: analytics.orders_created, icon: ShoppingCart },
+        { title: "Sessions", value: analytics.orders_created, icon: ShoppingCart },
         { title: "Voice Revenue", value: fmtMoney(analytics.revenue), icon: Wallet },
         { title: "Avg Call Duration", value: fmtDuration(analytics.avg_duration_seconds), icon: Clock },
         { title: "AI Resolution Rate", value: `${analytics.total_calls ? Math.round((analytics.ai_resolved / analytics.total_calls) * 100) : 0}%`, icon: Gauge },

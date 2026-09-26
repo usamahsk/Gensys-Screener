@@ -96,6 +96,10 @@ class Order(Base):
     total: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
     source: Mapped[str] = mapped_column(String(24), default="voice_agent")
     call_id: Mapped[Optional[str]] = mapped_column(String(64), default="", index=True)
+    # Voice-platform provider + provider-side telephony id (e.g. dograh run's
+    # Twilio/Vonage/Plivo Call SID). Mirrors genesys_conversation_id on Call.
+    provider: Mapped[str] = mapped_column(String(32), default="dograh")
+    provider_call_id: Mapped[Optional[str]] = mapped_column(String(128), default="", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -162,6 +166,11 @@ class Call(Base):
     user_recording_url: Mapped[Optional[str]] = mapped_column(String(512), default="")
     bot_recording_url: Mapped[Optional[str]] = mapped_column(String(512), default="")
     genesys_conversation_id: Mapped[Optional[str]] = mapped_column(String(64), default="")
+    # Generic voice-platform provider + provider-side telephony id.
+    # e.g. provider="dograh", provider_call_id=<Twilio/Vonage/Plivo Call SID>.
+    # genesys_conversation_id is kept as the Genesys-flavoured alias (mirrored).
+    provider: Mapped[str] = mapped_column(String(32), default="dograh")
+    provider_call_id: Mapped[Optional[str]] = mapped_column(String(128), default="", index=True)
     # Link back to the voice platform run (populated on import; webhook path keeps UUID call_id)
     workflow_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)

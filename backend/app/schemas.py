@@ -126,6 +126,10 @@ class OrderCreateRequest(BaseModel):
     items: list[OrderItemIn] = Field(default_factory=list)
     total: Optional[float] = None
     call_id: Optional[str] = ""
+    # --- Voice-platform provider + telephony id (Dograh flavour of Genesys id) ---
+    provider: Optional[str] = ""
+    provider_call_id: Optional[str] = ""
+    telephony_id: Optional[str] = ""
     # --- Dograh webhook context (all optional, also accepted on order-status) ---
     workflow_run_id: Optional[str] = ""
     first_name: Optional[str] = ""
@@ -172,6 +176,14 @@ class OrderCreateRequest(BaseModel):
             "payment_method": "payment_method",
             "workflow run id": "call_id",
             "workflow_run_id": "call_id",
+            "telephony id": "provider_call_id",
+            "telephony_id": "provider_call_id",
+            "telephony call id": "provider_call_id",
+            "provider call id": "provider_call_id",
+            "provider_call_id": "provider_call_id",
+            "provider id": "provider_call_id",
+            "call sid": "provider_call_id",
+            "twilio sid": "provider_call_id",
             "first name": "first_name",
             "user recording url": "user_recording_url",
             "bot recording url": "bot_recording_url",
@@ -246,6 +258,18 @@ class OrderCreateRequest(BaseModel):
             return ""
         return s
 
+    @field_validator("provider", "provider_call_id", "telephony_id", mode="before")
+    @classmethod
+    def _coerce_provider_fields(cls, v: Any) -> Any:
+        if v is None:
+            return ""
+        if is_unresolved_template(v):
+            return ""
+        s = str(v).strip()
+        if s.startswith("<") and s.endswith(">"):
+            return ""
+        return s[:128]
+
     @field_validator("order_type", mode="before")
     @classmethod
     def _coerce_order_type(cls, v: Any) -> Any:
@@ -260,6 +284,13 @@ class OrderCreateRequest(BaseModel):
 
     def resolved_call_id(self) -> str:
         return (self.call_id or self.workflow_run_id or "").strip()
+
+    def resolved_provider(self) -> str:
+        p = clean_str(self.provider).lower() or "dograh"
+        return p[:32]
+
+    def resolved_provider_call_id(self) -> str:
+        return clean_str(self.provider_call_id or self.telephony_id)[:128]
 
     def resolved_duration(self) -> int:
         try:
@@ -304,6 +335,8 @@ class OrderOut(BaseModel):
     total: Decimal
     source: str
     call_id: str
+    provider: str = ""
+    provider_call_id: str = ""
     created_at: datetime
     items: list[OrderItemOut] = []
     events: list[OrderEventOut] = []
@@ -363,6 +396,13 @@ class CallEndedWebhook(BaseModel):
     # identity — friend sends call_id={{workflow_run_id}}
     call_id: str = ""
     workflow_run_id: str = ""
+    # voice-platform provider + provider-side telephony id
+    # (Dograh flavour of the Genesys conversation id).
+    provider: str = ""
+    provider_call_id: str = ""
+    telephony_id: str = ""
+    telephony_call_id: str = ""
+    call_sid: str = ""
 
     # customer
     first_name: str = ""
@@ -449,6 +489,15 @@ class CallEndedWebhook(BaseModel):
             "first name": "first_name",
             "workflow run id": "call_id",
             "workflow_run_id": "call_id",
+            "telephony id": "provider_call_id",
+            "telephony_id": "provider_call_id",
+            "telephony call id": "telephony_call_id",
+            "provider call id": "provider_call_id",
+            "provider_call_id": "provider_call_id",
+            "provider id": "provider_call_id",
+            "call sid": "call_sid",
+            "call_sid": "call_sid",
+            "twilio sid": "call_sid",
             "payment method": "payment_method",
             "delivery address": "delivery_address",
             "user recording url": "user_recording_url",
@@ -515,6 +564,8 @@ class CallEndedWebhook(BaseModel):
                      "transcript_url", "call_outcome", "sentiment", "disposition",
                      "order_number", "fulfillment_type", "delivery_address",
                      "payment_method", "transfer_reason", "genesys_conversation_id",
+                     "provider", "provider_call_id", "telephony_id",
+                     "telephony_call_id", "call_sid",
                      "reservation_date", "reservation_time", mode="before")
     @classmethod
     def _coerce_strs(cls, v: Any) -> Any:
@@ -594,6 +645,18 @@ class CallEndedWebhook(BaseModel):
     def resolved_call_id(self) -> str:
         return self.call_id or self.workflow_run_id
 
+    def resolved_provider(self) -> str:
+        p = clean_str(self.provider).lower() or "dograh"
+        return p[:32]
+
+    def resolved_provider_call_id(self) -> str:
+        for cand in (self.provider_call_id, self.telephony_id,
+                     self.telephony_call_id, self.call_sid):
+            s = clean_str(cand)
+            if s:
+                return s[:128]
+        return ""
+
     def resolved_customer_name(self) -> str:
         return self.customer_name or self.first_name
 
@@ -653,6 +716,8 @@ class CallOut(BaseModel):
     sentiment: str
     recording_url: str = ""
     transcript_url: str = ""
+    provider: str = ""
+    provider_call_id: str = ""
 
     class Config:
         from_attributes = True

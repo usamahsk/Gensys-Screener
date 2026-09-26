@@ -51,6 +51,16 @@ async def call_ended(
     duration = payload.resolved_duration()
     customer_name = payload.resolved_customer_name()
     customer_phone = payload.resolved_customer_phone()
+    provider = payload.resolved_provider()
+    provider_call_id = payload.resolved_provider_call_id()
+    # Genesys id stays the canonical Genesys-flavoured column; mirror the
+    # generic telephony id into it when the provider is Genesys (or when the
+    # payload only carried the legacy genesys_conversation_id field).
+    genesys_id = payload.genesys_conversation_id or (
+        provider_call_id if provider == "genesys" else ""
+    )
+    if provider == "genesys" and not provider_call_id:
+        provider_call_id = genesys_id
 
     summary = await summarize(payload.transcript, payload.tool_calls, disposition)
     if not summary and (payload.order_number or payload.transfer_reason):
@@ -83,7 +93,9 @@ async def call_ended(
         transcript_url=payload.transcript_url or "",
         user_recording_url=payload.user_recording_url or "",
         bot_recording_url=payload.bot_recording_url or "",
-        genesys_conversation_id=payload.genesys_conversation_id or "",
+        genesys_conversation_id=genesys_id,
+        provider=provider,
+        provider_call_id=provider_call_id,
     )
     db.add(call)
 
@@ -176,6 +188,9 @@ async def _materialize_order(
         order.total = Decimal(str(p.total_price)) if p.total_price else order.total
         if not order.call_id and call_id and call_id != "unknown":
             order.call_id = call_id
+        if not order.provider_call_id and p.resolved_provider_call_id():
+            order.provider = p.resolved_provider()
+            order.provider_call_id = p.resolved_provider_call_id()
         if p.delivery_address and not order.delivery_address:
             order.delivery_address = p.delivery_address
         if p.payment_method and not order.payment_method:
@@ -194,6 +209,8 @@ async def _materialize_order(
         total=Decimal(str(p.total_price)) if p.total_price else Decimal("0"),
         source="voice_agent",
         call_id=call_id,
+        provider=p.resolved_provider(),
+        provider_call_id=p.resolved_provider_call_id(),
     )
     db.add(order)
     await db.flush()

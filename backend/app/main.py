@@ -9,7 +9,7 @@ from loguru import logger
 from app.config import get_settings
 from app.db import engine
 from app.models import Base
-from app.routers import analytics, calls, integration, orders, tools, webhooks
+from app.routers import analytics, calls, integration, orders, reports, telephony, tools, transactions, webhooks
 
 settings = get_settings()
 
@@ -18,6 +18,21 @@ settings = get_settings()
 async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Lightweight forward-migration for existing DBs (create_all won't
+        # add columns to tables that already exist).
+        from sqlalchemy import text as _text
+        for _stmt in (
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS provider VARCHAR(32) DEFAULT 'dograh'",
+            "ALTER TABLE calls ADD COLUMN IF NOT EXISTS provider_call_id VARCHAR(128) DEFAULT ''",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider VARCHAR(32) DEFAULT 'dograh'",
+            "ALTER TABLE orders ADD COLUMN IF NOT EXISTS provider_call_id VARCHAR(128) DEFAULT ''",
+            "CREATE INDEX IF NOT EXISTS ix_calls_provider_call_id ON calls (provider_call_id)",
+            "CREATE INDEX IF NOT EXISTS ix_orders_provider_call_id ON orders (provider_call_id)",
+        ):
+            try:
+                await conn.execute(_text(_stmt))
+            except Exception as e:
+                logger.warning(f"migration skipped ({_stmt[:60]}…): {e}")
     if not settings.seed_enabled:
         logger.info("Boot seeding disabled (KFC_SEED_ENABLED=false) — starting with existing data only")
         yield
@@ -51,6 +66,9 @@ app.include_router(integration.router)
 app.include_router(integration.google_router)
 app.include_router(integration.langfuse_router)
 app.include_router(analytics.router)
+app.include_router(reports.router)
+app.include_router(transactions.router)
+app.include_router(telephony.router)
 
 
 @app.exception_handler(RequestValidationError)

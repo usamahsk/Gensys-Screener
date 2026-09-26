@@ -130,7 +130,7 @@ export default function AgentViewPage() {
                     <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#EAF1FF]">
                       <ShoppingCart className="h-4 w-4 text-[#0068FF]" />
                     </span>
-                    Related Orders
+                    Related Sessions
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-2 text-sm">

@@ -189,7 +189,7 @@ export default function ModelsPage() {
   };
 
   return (
-    <div className="mx-auto max-w-3xl space-y-5">
+    <div className="mx-auto max-w-5xl space-y-5">
       <PageHeader
         icon={Cpu}
         title="Models (BYOK)"
@@ -256,17 +256,17 @@ export default function ModelsPage() {
           </Card>
 
           {byokMode === "pipeline" ? (
-            <>
+            <div className="grid items-start gap-5 md:grid-cols-2">
               <ServiceFields title="LLM — reasoning" icon={Brain} value={llm} onChange={setLlm} providers={LLM_PROVIDERS} />
               <ServiceFields title="Speech-to-Text" icon={Mic} value={stt} onChange={setStt} providers={STT_PROVIDERS} />
               <ServiceFields title="Text-to-Speech" icon={Volume2} value={tts} onChange={setTts} providers={TTS_PROVIDERS} showVoice />
               <ServiceFields title="Embeddings" icon={Layers} value={emb} onChange={setEmb} providers={EMB_PROVIDERS} />
-            </>
+            </div>
           ) : (
-            <>
+            <div className="grid items-start gap-5 md:grid-cols-2">
               <ServiceFields title="Realtime model" icon={Zap} value={rt} onChange={setRt} providers={RT_PROVIDERS} />
               <ServiceFields title="Embeddings" icon={Layers} value={emb} onChange={setEmb} providers={EMB_PROVIDERS} />
-            </>
+            </div>
           )}
         </>
       )}

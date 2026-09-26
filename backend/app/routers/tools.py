@@ -65,6 +65,8 @@ async def _log_tool_call(
     order_number: str = "",
     tool_name: str = "",
     tool_summary: str = "",
+    provider: str = "",
+    provider_call_id: str = "",
 ) -> Call | None:
     """Create or update the Call Logs row for this tool call.
 
@@ -100,6 +102,8 @@ async def _log_tool_call(
             order_numbers=[order_number] if order_number else [],
             tool_calls=[{"name": tool_name, "args_summary": tool_summary}] if tool_name else [],
             summary=tool_summary,
+            provider=(provider or "dograh")[:32],
+            provider_call_id=(provider_call_id or "")[:128],
         )
         db.add(call)
         await db.flush()
@@ -125,6 +129,10 @@ async def _log_tool_call(
         call.bot_recording_url = bot_recording_url
     if transcript_url and not call.transcript_url:
         call.transcript_url = transcript_url
+    if provider_call_id and not call.provider_call_id:
+        call.provider_call_id = provider_call_id[:128]
+    if provider and not (call.provider and call.provider != "dograh"):
+        call.provider = provider[:32]
     if order_number and order_number not in (call.order_numbers or []):
         call.order_numbers = [*(call.order_numbers or []), order_number]
     if tool_name:
@@ -175,6 +183,8 @@ async def create_order(
             order_number="",
             tool_name="create_order",
             tool_summary="noted (pending transcript extraction)",
+            provider=req.resolved_provider(),
+            provider_call_id=req.resolved_provider_call_id(),
         )
         await db.commit()
         return OrderCreatedResponse(
@@ -210,6 +220,8 @@ async def create_order(
         status="confirmed",
         total=D(str(round(total, 2))),
         call_id=req.resolved_call_id(),
+        provider=req.resolved_provider(),
+        provider_call_id=req.resolved_provider_call_id(),
     )
     db.add(order)
     await db.flush()
@@ -274,6 +286,8 @@ async def create_order(
         order_number=order.order_number,
         tool_name="create_order",
             tool_summary=f"{order.order_number}: {item_desc} (${order.total})",
+        provider=req.resolved_provider(),
+        provider_call_id=req.resolved_provider_call_id(),
     )
 
     await db.commit()

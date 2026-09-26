@@ -136,12 +136,14 @@ export default function SettingsPage() {
   };
 
   return (
-    <div className="mx-auto max-w-xl space-y-6">
+    <div className="mx-auto max-w-6xl space-y-6">
       <PageHeader
         icon={SettingsIcon}
         title="Settings"
         description="Connect this dashboard directly to your voice AI instance."
       />
+
+      <div className="grid items-start gap-6 lg:grid-cols-2">
 
       <Card className="card-clean">
         <CardHeader>
@@ -231,7 +233,7 @@ export default function SettingsPage() {
         </CardContent>
       </Card>
 
-      <Card className="card-clean">
+      <Card className="card-clean lg:col-span-2">
         <CardHeader>
           <CardTitle className="flex items-center gap-2 text-sm text-[#000E49]">
             <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#EAF1FF]">
@@ -290,6 +292,7 @@ export default function SettingsPage() {
           </div>
         </CardContent>
       </Card>
+      </div>
     </div>
   );
 }

@@ -53,6 +53,8 @@ async def list_orders(
             Order.order_number.ilike(like)
             | Order.customer_name.ilike(like)
             | Order.customer_phone.ilike(like)
+            | Order.provider_call_id.ilike(like)
+            | Order.call_id.ilike(like)
         )
     rows = (await db.execute(q)).scalars().all()
     return [
@@ -70,6 +72,9 @@ async def list_orders(
             "source": o.source,
             "item_count": len(o.items),
             "created_at": o.created_at.isoformat(),
+            "provider": o.provider or "dograh",
+            "provider_call_id": o.provider_call_id or "",
+            "call_id": o.call_id or "",
         }
         for o in rows
     ]
@@ -100,6 +105,8 @@ async def order_detail(order_number: str, db: AsyncSession = Depends(get_db)):
         "total": float(order.total),
         "source": order.source,
         "call_id": order.call_id,
+        "provider": order.provider or "dograh",
+        "provider_call_id": order.provider_call_id or "",
         "created_at": order.created_at.isoformat(),
         "items": [
             {

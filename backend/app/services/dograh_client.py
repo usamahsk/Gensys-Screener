@@ -45,12 +45,15 @@ async def list_runs(
     limit: int = 50,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    filters: Optional[str] = None,
 ) -> dict[str, Any]:
     params: dict[str, Any] = {"page": page, "limit": min(limit, 100)}
     if start_date:
         params["start_date"] = start_date
     if end_date:
         params["end_date"] = end_date
+    if filters:
+        params["filters"] = filters
     url = f"{_base(base_url)}/api/v1/organizations/usage/runs"
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -223,3 +226,198 @@ async def push_langfuse_config(
     if isinstance(status, int) and status < 400:
         return {"pushed": True, "detail": "saved to Dograh org config"}
     return {"pushed": False, "detail": f"Dograh rejected ({status}): {str(result.get('body'))[:200]}"}
+
+
+# ---------- Knowledge base (Dograh org documents) ----------
+# Flow (per Dograh OpenAPI): POST /knowledge-base/upload-url (filename +
+# mime_type) -> PUT file bytes to the presigned upload_url -> POST
+# /knowledge-base/process-document (document_uuid + s3_key + retrieval_mode).
+
+async def list_kb_documents(
+    api_key: str, base_url: str, status: Optional[str] = None,
+    limit: int = 100, offset: int = 0,
+) -> dict[str, Any]:
+    params: dict[str, Any] = {"limit": min(max(limit, 1), 100), "offset": max(offset, 0)}
+    if status:
+        params["status"] = status
+    url = f"{_base(base_url)}/api/v1/knowledge-base/documents"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.get(url, params=params, headers={"X-API-Key": api_key})
+        r.raise_for_status()
+        return r.json()
+
+
+async def get_kb_upload_url(
+    api_key: str, base_url: str, filename: str, mime_type: str,
+) -> dict[str, Any]:
+    url = f"{_base(base_url)}/api/v1/knowledge-base/upload-url"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            url,
+            json={"filename": filename, "mime_type": mime_type},
+            headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+async def put_bytes_to_presigned_url(
+    upload_url: str, data: bytes, content_type: str,
+) -> None:
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.put(
+            upload_url, content=data,
+            headers={"Content-Type": content_type or "application/octet-stream"},
+        )
+        r.raise_for_status()
+
+
+async def process_kb_document(
+    api_key: str, base_url: str, document_uuid: str, s3_key: str,
+    retrieval_mode: str = "chunked",
+) -> dict[str, Any]:
+    mode = retrieval_mode if retrieval_mode in ("chunked", "full_document") else "chunked"
+    url = f"{_base(base_url)}/api/v1/knowledge-base/process-document"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.post(
+            url,
+            json={"document_uuid": document_uuid, "s3_key": s3_key,
+                  "retrieval_mode": mode},
+            headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+        )
+        r.raise_for_status()
+        return r.json()
+
+
+async def delete_kb_document(api_key: str, base_url: str, document_uuid: str) -> dict[str, Any]:
+    url = f"{_base(base_url)}/api/v1/knowledge-base/documents/{document_uuid}"
+    async with httpx.AsyncClient(timeout=30) as client:
+        r = await client.delete(url, headers={"X-API-Key": api_key})
+        r.raise_for_status()
+        try:
+            return r.json() if r.content else {"status": "deleted"}
+        except Exception:
+            return {"status": "deleted"}
+
+
+# ---------- Telephony configurations (providers + phone numbers) ----------
+
+class DograhProxyError(Exception):
+    """A proxied Dograh call failed — carries the upstream status + message."""
+
+    def __init__(self, status: int, detail: str):
+        super().__init__(detail)
+        self.status = status
+        self.detail = detail
+
+
+async def _proxy(
+    method: str, path: str, api_key: str, base_url: str,
+    json_body: Optional[dict] = None, params: Optional[dict] = None,
+) -> Any:
+    """Generic JSON proxy to the Dograh REST API (X-API-Key auth).
+
+    Returns the decoded body ({} for empty). Raises DograhProxyError with
+    the upstream status code so routers can forward Dograh's own 4xx
+    validation messages instead of a generic 502.
+    """
+    url = f"{_base(base_url)}/api/v1{path}"
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.request(
+                method, url, params=params,
+                json=json_body if json_body is not None else None,
+                headers={"X-API-Key": api_key, "Content-Type": "application/json"},
+            )
+    except httpx.HTTPError as e:
+        raise DograhProxyError(502, f"Voice platform unreachable: {e}")
+    if r.status_code >= 400:
+        detail = r.text[:800]
+        try:
+            body = r.json()
+            if isinstance(body, dict) and body.get("detail"):
+                d = body["detail"]
+                detail = str(d)[:800] if not isinstance(d, list) else "; ".join(
+                    str(i.get("msg", i)) for i in d[:5])[:800]
+        except Exception:
+            pass
+        raise DograhProxyError(r.status_code, detail or f"Voice platform error {r.status_code}")
+    if not r.content:
+        return {}
+    try:
+        return r.json()
+    except Exception:
+        return {"raw": r.text[:800]}
+
+
+async def telephony_providers_metadata(api_key: str, base_url: str) -> Any:
+    return await _proxy("GET", "/organizations/telephony-providers/metadata", api_key, base_url)
+
+
+async def telephony_config_warnings(api_key: str, base_url: str) -> Any:
+    return await _proxy("GET", "/organizations/telephony-config-warnings", api_key, base_url)
+
+
+async def list_telephony_configs(api_key: str, base_url: str) -> Any:
+    return await _proxy("GET", "/organizations/telephony-configs", api_key, base_url)
+
+
+async def create_telephony_config(api_key: str, base_url: str, payload: dict) -> Any:
+    return await _proxy("POST", "/organizations/telephony-configs", api_key, base_url, payload)
+
+
+async def get_telephony_config(api_key: str, base_url: str, config_id: int) -> Any:
+    return await _proxy("GET", f"/organizations/telephony-configs/{config_id}", api_key, base_url)
+
+
+async def update_telephony_config(api_key: str, base_url: str, config_id: int, payload: dict) -> Any:
+    return await _proxy("PUT", f"/organizations/telephony-configs/{config_id}", api_key, base_url, payload)
+
+
+async def delete_telephony_config(api_key: str, base_url: str, config_id: int) -> Any:
+    return await _proxy("DELETE", f"/organizations/telephony-configs/{config_id}", api_key, base_url)
+
+
+async def set_default_outbound(api_key: str, base_url: str, config_id: int) -> Any:
+    return await _proxy(
+        "POST", f"/organizations/telephony-configs/{config_id}/set-default-outbound",
+        api_key, base_url, {})
+
+
+async def reactivate_telephony_config(api_key: str, base_url: str, config_id: int) -> Any:
+    return await _proxy(
+        "POST", f"/organizations/telephony-configs/{config_id}/reactivate",
+        api_key, base_url, {})
+
+
+async def list_phone_numbers(api_key: str, base_url: str, config_id: int) -> Any:
+    return await _proxy(
+        "GET", f"/organizations/telephony-configs/{config_id}/phone-numbers",
+        api_key, base_url)
+
+
+async def add_phone_number(api_key: str, base_url: str, config_id: int, payload: dict) -> Any:
+    return await _proxy(
+        "POST", f"/organizations/telephony-configs/{config_id}/phone-numbers",
+        api_key, base_url, payload)
+
+
+async def update_phone_number(
+    api_key: str, base_url: str, config_id: int, number_id: int, payload: dict,
+) -> Any:
+    return await _proxy(
+        "PUT", f"/organizations/telephony-configs/{config_id}/phone-numbers/{number_id}",
+        api_key, base_url, payload)
+
+
+async def delete_phone_number(api_key: str, base_url: str, config_id: int, number_id: int) -> Any:
+    return await _proxy(
+        "DELETE", f"/organizations/telephony-configs/{config_id}/phone-numbers/{number_id}",
+        api_key, base_url)
+
+
+async def set_default_caller(api_key: str, base_url: str, config_id: int, number_id: int) -> Any:
+    return await _proxy(
+        "POST",
+        f"/organizations/telephony-configs/{config_id}/phone-numbers/{number_id}/set-default-caller",
+        api_key, base_url, {})
