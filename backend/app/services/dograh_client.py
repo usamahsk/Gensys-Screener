@@ -88,7 +88,7 @@ async def get_run_detail(
 async def fetch_public_text(url: str, base_url: str = "") -> str:
     """Fetch a time-limited public transcript URL (text). Resolves the
     storage redirect and rewrites localhost hosts so it works from Docker."""
-    data, _ = await fetch_public_bytes(url, base_url)
+    data, _, _ = await fetch_public_bytes(url, base_url)
     try:
         return data.decode("utf-8", errors="replace")
     except Exception:
@@ -116,16 +116,25 @@ def _container_reachable(url: str) -> str:
     return url
 
 
-async def fetch_public_bytes(url: str, base_url: str = "") -> tuple[bytes, str]:
+async def fetch_public_bytes(url: str, base_url: str = "") -> tuple[bytes, str, int]:
     """Resolve a Dograh public/storage URL to raw bytes.
 
     Public download links 302 to the storage service (often localhost:8080),
     which a container can't reach directly — so localhost hosts are rewritten
     for container→host access at each hop. Non-local hosts (S3, CDN, the
     voice host itself) are left untouched; relative paths are joined to base.
+
+    Returns (data, content_type, upstream_status). Non-200 upstreams (e.g.
+    404 on an expired time-limited link) come back as (b"", "", status) so
+    callers can report the real cause instead of a generic failure.
     """
+    from urllib.parse import urlsplit
+
     base = _base(base_url) if base_url else ""
-    current = _resolve_start_url(url, base)
+    start = _resolve_start_url(url, base)
+    if not start:
+        return b"", "", 0
+    current = start
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
             for _ in range(5):
@@ -135,12 +144,13 @@ async def fetch_public_bytes(url: str, base_url: str = "") -> tuple[bytes, str]:
                     continue
                 if r.status_code == 200:
                     ctype = r.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
-                    return r.content, _fix_content_type(ctype, current, r.content)
-                logger.warning(f"fetch_public_bytes {r.status_code} for {current[:100]}")
-                return b"", ""
+                    return r.content, _fix_content_type(ctype, current, r.content), 200
+                host = urlsplit(current).netloc
+                logger.warning(f"fetch_public_bytes upstream {r.status_code} host={host} url={start[:120]}")
+                return b"", "", r.status_code
     except Exception as e:
-        logger.warning(f"fetch_public_bytes error: {e}")
-    return b"", ""
+        logger.warning(f"fetch_public_bytes error for {start[:120]}: {e}")
+    return b"", "", 0
 
 
 def _resolve_start_url(url: str, base: str) -> str:

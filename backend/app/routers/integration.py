@@ -270,9 +270,17 @@ async def proxy_dograh_file(
         raise HTTPException(400, "No voice platform API key configured")
     if not (url or "").strip():
         raise HTTPException(400, "Missing ?url=")
-    data, content_type = await dograh_client.fetch_public_bytes(url.strip(), s.base_url)
+    data, content_type, upstream = await dograh_client.fetch_public_bytes(url.strip(), s.base_url)
     if not data:
-        raise HTTPException(502, "Could not fetch file from voice platform storage")
+        if upstream in (404, 410):
+            # Time-limited public links expire — reopening run details mints a fresh one.
+            raise HTTPException(
+                410,
+                "This download link has expired (voice platform returned 404). "
+                "Reopen the transaction to refresh the run evidence, then download again.",
+            )
+        detail = f"voice platform returned {upstream}" if upstream else "voice platform unreachable"
+        raise HTTPException(502, f"Could not fetch file: {detail}")
     wants_download = str(download or "").lower() in ("1", "true", "yes", "on", "download")
     headers: dict[str, str] = {}
     if wants_download:

@@ -156,6 +156,7 @@ export default function TransactionsPage() {
 
   const [selected, setSelected] = useState<TransactionRow | null>(null);
   const [backfilling, setBackfilling] = useState(false);
+  const [downloadingFile, setDownloadingFile] = useState(false);
   const [callDetail, setCallDetail] = useState<CallDetail | null>(null);
   const [orderDetails, setOrderDetails] = useState<OrderDetail[]>([]);
   const [runEvidence, setRunEvidence] = useState<RunEvidence | null>(null);
@@ -268,6 +269,46 @@ export default function TransactionsPage() {
       });
     } catch {
       setRunEvidence(null);
+    }
+  };
+
+  const downloadRunFile = async (kind: "transcript" | "recording") => {
+    // Public voice-platform links are time-limited, so mint a fresh run
+    // detail first and download through the backend proxy as a blob.
+    if (!runEvidence?.runId || !runEvidence?.workflowId) {
+      toast.error("No run linked to this transaction");
+      return;
+    }
+    setDownloadingFile(true);
+    try {
+      const detail = await apiClient.dograhRunDetail(runEvidence.runId, runEvidence.workflowId);
+      const freshUrl =
+        kind === "transcript"
+          ? detail.transcript_public_url || detail.transcript_url
+          : detail.recording_public_url || detail.recording_url;
+      if (typeof freshUrl !== "string" || !freshUrl) {
+        toast.error(`No ${kind} URL on this run`);
+        return;
+      }
+      const filename = `${kind}-run-${runEvidence.runId}${kind === "transcript" ? ".txt" : ".wav"}`;
+      const res = await fetch(proxiedFileUrl(freshUrl, filename, true));
+      if (!res.ok) {
+        const body = await res.text();
+        throw new Error(body.slice(0, 200) || `Download failed (${res.status})`);
+      }
+      const blob = await res.blob();
+      const objUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = objUrl;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Download failed");
+    } finally {
+      setDownloadingFile(false);
     }
   };
 
@@ -664,30 +705,24 @@ export default function TransactionsPage() {
                     <div className="text-xs font-semibold text-muted-foreground">RUN EVIDENCE — VOICE PLATFORM</div>
                     <div className="flex flex-wrap gap-1">
                       {runEvidence.recordingUrl && (
-                        <a
-                          href={proxiedFileUrl(
-                            runEvidence.recordingUrl,
-                            `recording-run-${runEvidence.runId ?? "unknown"}.wav`,
-                            true
-                          )}
-                          target="_blank"
-                          rel="noreferrer"
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={downloadingFile}
+                          onClick={() => downloadRunFile("recording")}
                         >
-                          <Button size="sm" variant="outline"><Download className="mr-1 h-3 w-3" /> Recording</Button>
-                        </a>
+                          <Download className="mr-1 h-3 w-3" /> Recording
+                        </Button>
                       )}
-                      {runEvidence.transcriptUrl && (
-                        <a
-                          href={proxiedFileUrl(
-                            runEvidence.transcriptUrl,
-                            `transcript-run-${runEvidence.runId ?? "unknown"}.txt`,
-                            true
-                          )}
-                          target="_blank"
-                          rel="noreferrer"
+                      {(runEvidence.transcriptUrl || runEvidence.transcript) && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={downloadingFile}
+                          onClick={() => downloadRunFile("transcript")}
                         >
-                          <Button size="sm" variant="outline"><Download className="mr-1 h-3 w-3" /> Transcript file</Button>
-                        </a>
+                          <Download className="mr-1 h-3 w-3" /> Transcript file
+                        </Button>
                       )}
                       {runEvidence.transcript && (
                         <Button
