@@ -294,7 +294,14 @@ export default function TransactionsPage() {
       const res = await fetch(proxiedFileUrl(freshUrl, filename, true));
       if (!res.ok) {
         const body = await res.text();
-        throw new Error(body.slice(0, 200) || `Download failed (${res.status})`);
+        let msg = body.slice(0, 200);
+        try {
+          const j = JSON.parse(body) as { detail?: unknown };
+          if (typeof j?.detail === "string" && j.detail) msg = j.detail;
+        } catch {
+          /* keep raw body snippet */
+        }
+        throw new Error(`${res.status}: ${msg}`);
       }
       const blob = await res.blob();
       const objUrl = URL.createObjectURL(blob);
@@ -306,7 +313,15 @@ export default function TransactionsPage() {
       a.remove();
       setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : "Download failed");
+      const msg = e instanceof Error ? e.message : "Download failed";
+      if (kind === "transcript" && runEvidence?.transcript) {
+        // The stored file is gone on the voice platform (expired/purged),
+        // but we already have the text on screen — save that instead.
+        downloadTextFile(`transcript-run-${runEvidence.runId}.txt`, runEvidence.transcript);
+        toast.warning(`Voice file unavailable (${msg}) — saved the on-screen transcript text instead.`);
+      } else {
+        toast.error(msg);
+      }
     } finally {
       setDownloadingFile(false);
     }
