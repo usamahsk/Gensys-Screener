@@ -94,8 +94,35 @@ function TypeBadge({ type }: { type: string }) {
 
 interface RunEvidence {
   recordingUrl: string | null;
+  transcriptUrl: string | null;
   transcript: string;
   gatheredContext: Record<string, unknown>;
+  initialContext: Record<string, unknown>;
+  runId: number | null;
+  workflowId: number | null;
+}
+
+function proxiedFileUrl(url: string, filename?: string, download = false) {
+  const qs = new URLSearchParams({ url });
+  if (download) qs.set("download", "1");
+  if (filename) qs.set("filename", filename);
+  return `${API_URL}/api/integration/dograh/file?${qs.toString()}`;
+}
+
+function downloadTextFile(filename: string, text: string) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const objUrl = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = objUrl;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
+}
+
+function turnsToText(turns: { role: string; content: string }[]) {
+  return turns.map((t) => `${t.role}: ${t.content}`).join("\n");
 }
 
 function isProviderSid(id: string) {
@@ -226,10 +253,18 @@ export default function TransactionsPage() {
         apiClient.dograhRunDetail(runId, workflowId),
       ]);
       const rec = detail.recording_public_url || detail.recording_url;
+      const tUrl =
+        (typeof detail.transcript_public_url === "string" && detail.transcript_public_url) ||
+        (typeof detail.transcript_url === "string" && detail.transcript_url) ||
+        null;
       setRunEvidence({
         recordingUrl: typeof rec === "string" ? rec : null,
+        transcriptUrl: tUrl,
         transcript: t.transcript,
         gatheredContext: (detail.gathered_context as Record<string, unknown>) || {},
+        initialContext: (detail.initial_context as Record<string, unknown>) || {},
+        runId,
+        workflowId,
       });
     } catch {
       setRunEvidence(null);
@@ -544,39 +579,65 @@ export default function TransactionsPage() {
                       <div className="mb-1 flex flex-wrap items-center justify-between gap-1 text-xs font-semibold text-muted-foreground">
                         <span className="flex items-center gap-1"><Volume2 className="h-3.5 w-3.5" /> Recording</span>
                         <span className="flex gap-1">
-                          <a href={callDetail.recording_url} download target="_blank" rel="noreferrer">
+                          <a
+                            href={proxiedFileUrl(callDetail.recording_url, `recording-${callDetail.call_id}.wav`, true)}
+                            target="_blank"
+                            rel="noreferrer"
+                          >
                             <Button size="sm" variant="outline"><Download className="mr-1 h-3 w-3" /> Download</Button>
                           </a>
                         </span>
                       </div>
-                      <audio controls className="w-full min-w-0" src={callDetail.recording_url} />
+                      <audio controls className="w-full min-w-0" src={proxiedFileUrl(callDetail.recording_url)} />
                     </div>
                   )}
                   {callDetail.user_recording_url && (
                     <div className="rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3">
                       <div className="mb-1 flex flex-wrap items-center justify-between gap-1 text-xs font-semibold text-muted-foreground">
                         <span className="flex items-center gap-1"><Mic className="h-3.5 w-3.5" /> Caller audio</span>
-                        <a href={callDetail.user_recording_url} download target="_blank" rel="noreferrer">
+                        <a
+                          href={proxiedFileUrl(callDetail.user_recording_url, `caller-${callDetail.call_id}.wav`, true)}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
                           <Button size="sm" variant="outline"><Download className="mr-1 h-3 w-3" /> Download</Button>
                         </a>
                       </div>
-                      <audio controls className="w-full min-w-0" src={callDetail.user_recording_url} />
+                      <audio controls className="w-full min-w-0" src={proxiedFileUrl(callDetail.user_recording_url)} />
                     </div>
                   )}
                   {callDetail.bot_recording_url && (
                     <div className="rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3">
                       <div className="mb-1 flex flex-wrap items-center justify-between gap-1 text-xs font-semibold text-muted-foreground">
                         <span className="flex items-center gap-1"><Bot className="h-3.5 w-3.5" /> Agent audio</span>
-                        <a href={callDetail.bot_recording_url} download target="_blank" rel="noreferrer">
+                        <a
+                          href={proxiedFileUrl(callDetail.bot_recording_url, `agent-${callDetail.call_id}.wav`, true)}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
                           <Button size="sm" variant="outline"><Download className="mr-1 h-3 w-3" /> Download</Button>
                         </a>
                       </div>
-                      <audio controls className="w-full min-w-0" src={callDetail.bot_recording_url} />
+                      <audio controls className="w-full min-w-0" src={proxiedFileUrl(callDetail.bot_recording_url)} />
                     </div>
                   )}
                   {callDetail.transcript.length > 0 && (
                     <div className="min-w-0">
-                      <div className="mb-1 text-xs font-semibold text-muted-foreground">Transcript</div>
+                      <div className="mb-1 flex flex-wrap items-center justify-between gap-1 text-xs font-semibold text-muted-foreground">
+                        <span>Transcript</span>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            downloadTextFile(
+                              `transcript-${callDetail.call_id}.txt`,
+                              turnsToText(callDetail.transcript)
+                            )
+                          }
+                        >
+                          <Download className="mr-1 h-3 w-3" /> Download transcript
+                        </Button>
+                      </div>
                       <ChatTranscript turns={callDetail.transcript} />
                     </div>
                   )}
@@ -601,13 +662,46 @@ export default function TransactionsPage() {
                 <div className="space-y-2 rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="text-xs font-semibold text-muted-foreground">RUN EVIDENCE — VOICE PLATFORM</div>
-                    <div className="flex gap-1">
+                    <div className="flex flex-wrap gap-1">
                       {runEvidence.recordingUrl && (
                         <a
-                          href={`${API_URL}/api/integration/dograh/file?url=${encodeURIComponent(runEvidence.recordingUrl)}&download=1`}
+                          href={proxiedFileUrl(
+                            runEvidence.recordingUrl,
+                            `recording-run-${runEvidence.runId ?? "unknown"}.wav`,
+                            true
+                          )}
+                          target="_blank"
+                          rel="noreferrer"
                         >
                           <Button size="sm" variant="outline"><Download className="mr-1 h-3 w-3" /> Recording</Button>
                         </a>
+                      )}
+                      {runEvidence.transcriptUrl && (
+                        <a
+                          href={proxiedFileUrl(
+                            runEvidence.transcriptUrl,
+                            `transcript-run-${runEvidence.runId ?? "unknown"}.txt`,
+                            true
+                          )}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          <Button size="sm" variant="outline"><Download className="mr-1 h-3 w-3" /> Transcript file</Button>
+                        </a>
+                      )}
+                      {runEvidence.transcript && (
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() =>
+                            downloadTextFile(
+                              `transcript-run-${runEvidence.runId ?? "unknown"}.txt`,
+                              runEvidence.transcript
+                            )
+                          }
+                        >
+                          <Download className="mr-1 h-3 w-3" /> Download transcript
+                        </Button>
                       )}
                       <Button size="sm" variant="outline" onClick={openTrace}>
                         <ExternalLink className="mr-1 h-3 w-3" /> Trace
@@ -618,7 +712,7 @@ export default function TransactionsPage() {
                     <audio
                       controls
                       className="w-full min-w-0"
-                      src={`${API_URL}/api/integration/dograh/file?url=${encodeURIComponent(runEvidence.recordingUrl)}`}
+                      src={proxiedFileUrl(runEvidence.recordingUrl)}
                     />
                   )}
                   {runEvidence.transcript ? (
@@ -627,6 +721,17 @@ export default function TransactionsPage() {
                     </div>
                   ) : (
                     <div className="text-xs text-muted-foreground">No run transcript.</div>
+                  )}
+                  {Object.keys(runEvidence.initialContext).length > 0 && (
+                    <details className="group rounded-xl border border-[#E2E8F4] bg-white">
+                      <summary className="cursor-pointer list-none px-3 py-2 text-xs font-semibold text-[#000E49] [&::-webkit-details-marker]:hidden">
+                        <span className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>
+                        Initial context
+                      </summary>
+                      <pre className="max-h-48 overflow-auto border-t border-[#E2E8F4] p-3 font-mono text-xs break-words whitespace-pre-wrap">
+                        {JSON.stringify(runEvidence.initialContext, null, 2)}
+                      </pre>
+                    </details>
                   )}
                   {Object.keys(runEvidence.gatheredContext).length > 0 && (
                     <details className="group rounded-xl border border-[#E2E8F4] bg-white">

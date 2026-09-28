@@ -241,8 +241,8 @@ async def run_transcript(
     if not transcript_url:
         runs = await list_dograh_runs(page=1, limit=100, db=db)
         for r in runs["runs"]:
-            if r["run_id"] == run_id and r["transcript_public_url"]:
-                transcript_url = r["transcript_public_url"]
+            if r["run_id"] == run_id and (r["transcript_public_url"] or r["transcript_url"]):
+                transcript_url = r["transcript_public_url"] or r["transcript_url"]
                 break
     if not transcript_url:
         raise HTTPException(404, "No transcript URL found for this run")
@@ -251,19 +251,52 @@ async def run_transcript(
 
 
 @router.get("/file")
-async def proxy_dograh_file(url: str, download: bool = False, db: AsyncSession = Depends(get_db)):
+async def proxy_dograh_file(
+    url: str,
+    download: Optional[str] = None,
+    filename: Optional[str] = None,
+    db: AsyncSession = Depends(get_db),
+):
     """Stream a voice platform recording/transcript file through our backend so the
     browser can play it without touching the voice platform/storage directly.
-    Pass ?download=1 to force a file download (Content-Disposition)."""
+    Pass ?download=1 to force a file download (Content-Disposition). Accepts
+    ?filename= to control the downloaded file name."""
     from fastapi.responses import StreamingResponse
+    from urllib.parse import quote, urlsplit
+    import os as _os
 
     s = await _get_setting(db)
     if not s.api_key:
         raise HTTPException(400, "No voice platform API key configured")
-    data, content_type = await dograh_client.fetch_public_bytes(url, s.base_url)
+    if not (url or "").strip():
+        raise HTTPException(400, "Missing ?url=")
+    data, content_type = await dograh_client.fetch_public_bytes(url.strip(), s.base_url)
     if not data:
         raise HTTPException(502, "Could not fetch file from voice platform storage")
-    headers = {"Content-Disposition": 'attachment; filename="recording"'} if download else {}
+    wants_download = str(download or "").lower() in ("1", "true", "yes", "on", "download")
+    headers: dict[str, str] = {}
+    if wants_download:
+        name = (filename or "").strip()
+        if not name:
+            # derive something sensible from the source URL, else fall back
+            # to an extension matching the resolved content type.
+            path = urlsplit(url).path.rstrip("/")
+            base = _os.path.basename(path)
+            if base and "." in base and len(base) <= 96:
+                name = base
+            else:
+                ext = {
+                    "audio/wav": ".wav", "audio/x-wav": ".wav",
+                    "audio/mpeg": ".mp3", "audio/ogg": ".ogg",
+                    "audio/mp4": ".m4a", "text/plain": ".txt",
+                }.get((content_type or "").split(";")[0].strip(), "")
+                kind = "transcript" if (content_type or "").startswith("text/") else "recording"
+                name = f"{kind}{ext}"
+        # RFC 5987 encoding so spaces/unicode survive Content-Disposition
+        headers["Content-Disposition"] = (
+            f"attachment; filename=\"{name.replace(chr(34), '')}\"; "
+            f"filename*=UTF-8''{quote(name)}"
+        )
     return StreamingResponse(iter([data]), media_type=content_type, headers=headers)
 
 

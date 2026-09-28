@@ -120,11 +120,12 @@ async def fetch_public_bytes(url: str, base_url: str = "") -> tuple[bytes, str]:
     """Resolve a Dograh public/storage URL to raw bytes.
 
     Public download links 302 to the storage service (often localhost:8080),
-    which a container can't reach directly — so hosts are rewritten for
-    container→host access at each hop.
+    which a container can't reach directly — so localhost hosts are rewritten
+    for container→host access at each hop. Non-local hosts (S3, CDN, the
+    voice host itself) are left untouched; relative paths are joined to base.
     """
     base = _base(base_url) if base_url else ""
-    current = _container_reachable(_with_host(url, base)) if base else _container_reachable(url)
+    current = _resolve_start_url(url, base)
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
             for _ in range(5):
@@ -140,6 +141,20 @@ async def fetch_public_bytes(url: str, base_url: str = "") -> tuple[bytes, str]:
     except Exception as e:
         logger.warning(f"fetch_public_bytes error: {e}")
     return b"", ""
+
+
+def _resolve_start_url(url: str, base: str) -> str:
+    """Build the first URL to fetch: keep absolute URLs as-is (except the
+    localhost→host rewrite); only join relative paths onto the base host."""
+    from urllib.parse import urlsplit, urljoin
+
+    u = (url or "").strip()
+    if not u:
+        return u
+    if base and not urlsplit(u).netloc:
+        # relative path like /api/v1/... → join onto the voice host
+        return urljoin(base.rstrip("/") + "/", u.lstrip("/"))
+    return _container_reachable(u)
 
 
 def _fix_content_type(ctype: str, url: str, data: bytes) -> str:
