@@ -88,7 +88,7 @@ async def get_run_detail(
 async def fetch_public_text(url: str, base_url: str = "") -> str:
     """Fetch a time-limited public transcript URL (text). Resolves the
     storage redirect and rewrites localhost hosts so it works from Docker."""
-    data, _, _ = await fetch_public_bytes(url, base_url)
+    data, _, _, _ = await fetch_public_bytes(url, base_url)
     try:
         return data.decode("utf-8", errors="replace")
     except Exception:
@@ -116,7 +116,7 @@ def _container_reachable(url: str) -> str:
     return url
 
 
-async def fetch_public_bytes(url: str, base_url: str = "") -> tuple[bytes, str, int]:
+async def fetch_public_bytes(url: str, base_url: str = "") -> tuple[bytes, str, int, list[str]]:
     """Resolve a Dograh public/storage URL to raw bytes.
 
     Public download links 302 to the storage service (often localhost:8080),
@@ -124,33 +124,41 @@ async def fetch_public_bytes(url: str, base_url: str = "") -> tuple[bytes, str, 
     for container→host access at each hop. Non-local hosts (S3, CDN, the
     voice host itself) are left untouched; relative paths are joined to base.
 
-    Returns (data, content_type, upstream_status). Non-200 upstreams (e.g.
-    404 on an expired time-limited link) come back as (b"", "", status) so
-    callers can report the real cause instead of a generic failure.
+    Returns (data, content_type, upstream_status, hops). Non-200 upstreams
+    (e.g. 404 on an expired time-limited link) come back as (b"", "", status,
+    hops) and every hop is recorded as "status@host" so callers can tell a
+    purged voice file apart from a wrong-host redirect or blocked egress.
     """
     from urllib.parse import urlsplit
 
     base = _base(base_url) if base_url else ""
     start = _resolve_start_url(url, base)
+    hops: list[str] = []
     if not start:
-        return b"", "", 0
+        return b"", "", 0, hops
     current = start
     try:
         async with httpx.AsyncClient(timeout=30, follow_redirects=False) as client:
             for _ in range(5):
+                host = urlsplit(current).netloc or "(no-host)"
                 r = await client.get(current)
                 if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("location"):
-                    current = _container_reachable(r.headers["location"])
+                    target = r.headers["location"]
+                    hops.append(f"{r.status_code}@{host}-> redirects")
+                    current = _container_reachable(target)
                     continue
                 if r.status_code == 200:
                     ctype = r.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
-                    return r.content, _fix_content_type(ctype, current, r.content), 200
-                host = urlsplit(current).netloc
-                logger.warning(f"fetch_public_bytes upstream {r.status_code} host={host} url={start[:120]}")
-                return b"", "", r.status_code
+                    hops.append(f"200@{host}")
+                    return r.content, _fix_content_type(ctype, current, r.content), 200, hops
+                hops.append(f"{r.status_code}@{host}")
+                logger.warning(f"fetch_public_bytes upstream {' -> '.join(hops)} url={start[:120]}")
+                return b"", "", r.status_code, hops
     except Exception as e:
+        host = urlsplit(current).netloc or "(no-host)"
+        hops.append(f"ERR@{host}: {e}")
         logger.warning(f"fetch_public_bytes error for {start[:120]}: {e}")
-    return b"", "", 0
+    return b"", "", 0, hops
 
 
 def _resolve_start_url(url: str, base: str) -> str:

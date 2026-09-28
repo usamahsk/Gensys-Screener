@@ -185,6 +185,15 @@ Response: `201` with the stored memory object.
 
 ---
 
+## Next order number (sequential)
+
+**Method:** `GET`  **URL:** `<BASE>/api/orders/next-number`
+
+Response: `{ "total_orders": 1381, "next_order_number": 1382 }`
+
+Call this before `create_order` and use `next_order_number` as the order
+number so numbering stays sequential (total count + 1).
+
 ## Post-call webhooks (not agent tools — configure in Dograh's post-call/webhook hook, or trigger at call end)
 
 **Call ended** — `POST <BASE>/api/webhooks/call-ended`
@@ -209,6 +218,18 @@ Response: `201` with the stored memory object.
 }
 ```
 `disposition`: completed | transferred | failed | abandoned.
+
+> **When does call-ended fire?** Only when the Dograh workflow has this URL
+> configured as its post-call webhook — it then fires after EVERY call end,
+> including caller hangups ("call cut"). If no call row appears at all, the
+> webhook URL is missing/misconfigured on the Dograh side.
+>
+> **Cut calls with no order?** A hangup webhook usually carries no order
+> fields and no transcript. The app then recovers automatically: first from
+> the webhook transcript, else from the voice-platform run transcript (needs
+> the Dograh API key in Settings), extracted via Gemini (needs the Google key
+> in Settings with recovery enabled). If both keys are set and still no
+> order, check the api logs — the transcript was empty or had no order in it.
 
 **Escalation/transfer** — `POST <BASE>/api/webhooks/transfer`
 ```json

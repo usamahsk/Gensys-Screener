@@ -4,7 +4,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -14,6 +14,18 @@ from app.models import Order, OrderEvent
 router = APIRouter(prefix="/api/orders", tags=["dashboard"])
 
 VALID_STATUSES = {"confirmed", "preparing", "ready", "in_transit", "completed", "cancelled"}
+
+
+@router.get("/next-number")
+async def next_order_number(db: AsyncSession = Depends(get_db)):
+    """Total order count + the next sequential number (total + 1).
+
+    The voice workflow calls this before creating an order so order numbers
+    stay sequential: next_order_number = total_orders + 1. (Must be declared
+    before /{order_number} or FastAPI would treat "next-number" as an id.)
+    """
+    total = (await db.execute(select(func.count()).select_from(Order))).scalar_one()
+    return {"total_orders": total, "next_order_number": total + 1}
 
 
 class StatusUpdateRequest(BaseModel):

@@ -273,8 +273,10 @@ export default function TransactionsPage() {
   };
 
   const downloadRunFile = async (kind: "transcript" | "recording") => {
-    // Public voice-platform links are time-limited, so mint a fresh run
-    // detail first and download through the backend proxy as a blob.
+    // Dograh-style: open a freshly-minted public URL straight in the browser
+    // so the file downloads directly to the PC (no backend hop, no egress
+    // permission issues on the server). Falls back to the on-screen text for
+    // transcripts when the voice file is gone.
     if (!runEvidence?.runId || !runEvidence?.workflowId) {
       toast.error("No run linked to this transaction");
       return;
@@ -287,31 +289,9 @@ export default function TransactionsPage() {
           ? detail.transcript_public_url || detail.transcript_url
           : detail.recording_public_url || detail.recording_url;
       if (typeof freshUrl !== "string" || !freshUrl) {
-        toast.error(`No ${kind} URL on this run`);
-        return;
+        throw new Error(`No ${kind} URL on this run`);
       }
-      const filename = `${kind}-run-${runEvidence.runId}${kind === "transcript" ? ".txt" : ".wav"}`;
-      const res = await fetch(proxiedFileUrl(freshUrl, filename, true));
-      if (!res.ok) {
-        const body = await res.text();
-        let msg = body.slice(0, 200);
-        try {
-          const j = JSON.parse(body) as { detail?: unknown };
-          if (typeof j?.detail === "string" && j.detail) msg = j.detail;
-        } catch {
-          /* keep raw body snippet */
-        }
-        throw new Error(`${res.status}: ${msg}`);
-      }
-      const blob = await res.blob();
-      const objUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = objUrl;
-      a.download = filename;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
+      window.open(freshUrl, "_blank", "noopener,noreferrer");
     } catch (e) {
       const msg = e instanceof Error ? e.message : "Download failed";
       if (kind === "transcript" && runEvidence?.transcript) {

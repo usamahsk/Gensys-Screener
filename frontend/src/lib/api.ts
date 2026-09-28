@@ -217,6 +217,10 @@ export const apiClient = {
   },
   orderDetail: (orderNumber: string) =>
     api<OrderDetail>(`/api/orders/${orderNumber}`),
+  nextOrderNumber: () =>
+    api<{ total_orders: number; next_order_number: number }>(
+      "/api/orders/next-number"
+    ),
   updateOrderStatus: (orderNumber: string, status: string, note = "") =>
     api<{ status: string }>(`/api/orders/${orderNumber}/status`, {
       method: "PATCH",

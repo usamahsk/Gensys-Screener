@@ -23,7 +23,7 @@ from sqlalchemy.orm import selectinload
 
 from app.config import get_settings
 from app.db import SessionLocal
-from app.models import Call, Customer, GoogleSetting, Memory, Order, OrderEvent, OrderItem
+from app.models import Call, Customer, DograhSetting, GoogleSetting, Memory, Order, OrderEvent, OrderItem
 from app.schemas import OrderCreateRequest, clean_str
 from app.services.embeddings import embed_one
 
@@ -363,6 +363,59 @@ async def create_order_from_transcript(
     return order
 
 
+async def _transcript_from_run(db, call: Call) -> str:
+    """Cut-call fallback: the post-call webhook often arrives with no
+    transcript when the caller hangs up. Pull it from the voice platform run
+    instead (matched by call UUID in gathered context), persist it on the
+    call, and return the text for extraction. Needs the Dograh API key."""
+    try:
+        from app.services import dograh_client as _dc
+        row = (await db.execute(
+            select(DograhSetting).where(DograhSetting.id == 1))).scalar_one_or_none()
+        api_key = (row.api_key if row else "" or "").strip()
+        base_url = (row.base_url if row else "") or ""
+        if not api_key or not (call.call_id or "").strip():
+            return ""
+        run_id, wf_id = call.run_id, call.workflow_id
+        if not run_id or not wf_id:
+            # Scan recent runs for the one whose context carries our call UUID.
+            page, scanned = 1, 0
+            while scanned < 500:
+                data = await _dc.list_runs(api_key, base_url, page=page, limit=100)
+                runs = data.get("runs", []) or []
+                if not runs:
+                    break
+                for r in runs:
+                    gc = r.get("gathered_context") or {}
+                    if gc.get("call_id") == call.call_id or str(r.get("id")) == call.call_id:
+                        run_id, wf_id = r.get("id"), r.get("workflow_id")
+                        break
+                if run_id and wf_id:
+                    call.run_id, call.workflow_id = run_id, wf_id
+                    break
+                scanned += len(runs)
+                if page >= data.get("total_pages", 1):
+                    break
+                page += 1
+        if not run_id or not wf_id:
+            return ""
+        detail = await _dc.get_run_detail(api_key, base_url, wf_id, run_id)
+        turl = detail.get("transcript_public_url") or detail.get("transcript_url") or ""
+        if not turl:
+            return ""
+        text = await _dc.fetch_public_text(turl, base_url)
+        if text.strip():
+            if not call.transcript:
+                call.transcript = [{"role": "transcript", "content": text}]
+            if not call.transcript_url:
+                call.transcript_url = turl
+            logger.info(f"order_recovery: transcript pulled from run {run_id} for call {call.call_id!r}")
+        return text
+    except Exception as e:
+        logger.warning(f"order_recovery: run transcript fallback failed: {e}")
+        return ""
+
+
 async def recover_order_from_call(call_id: str, order_number: str | None = None) -> dict:
     """Background entry point: extract one call's order from its transcript.
     Creates the order on success, saves nothing on failure — the UI only
@@ -389,6 +442,9 @@ async def recover_order_from_call(call_id: str, order_number: str | None = None)
         text = _transcript_text(call)
         if not text and call.transcript_url:
             text = await _download_text(call.transcript_url)
+        if not text.strip():
+            # Cut call: webhook carried no transcript → try the voice run.
+            text = await _transcript_from_run(db, call) or ""
         if not text.strip():
             return {"status": "skipped", "reason": "no transcript"}
 
