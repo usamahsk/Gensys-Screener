@@ -308,6 +308,11 @@ export const apiClient = {
       "/api/transactions/backfill-provider-ids",
       { method: "POST" }
     ),
+  backfillPurposes: () =>
+    api<{ scanned: number; updated: number }>(
+      "/api/transactions/backfill-purposes",
+      { method: "POST" }
+    ),
   telephonyProviders: () =>
     api<{ providers: TelephonyProviderMeta[] }>(
       "/api/integration/dograh/telephony/providers"

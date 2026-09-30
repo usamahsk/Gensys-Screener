@@ -71,46 +71,53 @@ function statusClass(s: string) {
   return map[s] || "bg-gray-100 text-gray-700";
 }
 
-function PurposeBadge({ purpose }: { purpose: string }) {
-  if (!purpose) return null;
-  const map: Record<string, string> = {
-    order_creation: "bg-[#0068FF] text-white hover:bg-[#0057DC]",
-    order_status: "bg-cyan-100 text-cyan-900 hover:bg-cyan-100",
-    reservation: "bg-violet-100 text-violet-900 hover:bg-violet-100",
-    general: "bg-gray-100 text-gray-700 hover:bg-gray-100",
-  };
-  return (
-    <Badge variant="secondary" className={map[purpose] || "bg-gray-100 text-gray-700"}>
-      {purpose.replace("_", " ")}
-    </Badge>
-  );
-}
-
-function TypeBadge({ type, purpose }: { type: string; purpose?: string }) {
-  if (purpose === "reservation" || type === "reservation") {
+function CallPurposeBadge({ type, purpose }: { type: string; purpose?: string }) {
+  // Single source of truth for "what was this call for".
+  // Purpose (classifier/tool tag) wins; legacy call_type is the fallback so
+  // old rows without a purpose still show the right chip.
+  const p = (purpose || "").trim();
+  const t = (type || "").trim();
+  const kind =
+    p === "reservation" || t === "reservation"
+      ? "reservation"
+      : p === "order_status" || t === "order_status"
+        ? "order_status"
+        : p === "order_creation" || t === "create_order"
+          ? "order_creation"
+          : p === "general"
+            ? "general"
+            : "call";
+  if (kind === "reservation") {
     return (
       <Badge variant="secondary" className="bg-violet-100 text-violet-900 hover:bg-violet-100">
         <FileText className="mr-1 h-3 w-3" /> reservation
       </Badge>
     );
   }
-  if (type === "create_order") {
+  if (kind === "order_creation") {
     return (
       <Badge className="bg-[#0068FF] text-white hover:bg-[#0057DC]">
         <ShoppingCart className="mr-1 h-3 w-3" /> create order
       </Badge>
     );
   }
-  if (type === "order_status" || purpose === "order_status") {
+  if (kind === "order_status") {
     return (
       <Badge variant="secondary" className="bg-cyan-100 text-cyan-900 hover:bg-cyan-100">
         <FileText className="mr-1 h-3 w-3" /> order status
       </Badge>
     );
   }
+  if (kind === "general") {
+    return (
+      <Badge variant="secondary" className="bg-gray-100 text-gray-700 hover:bg-gray-100">
+        <PhoneCall className="mr-1 h-3 w-3" /> general
+      </Badge>
+    );
+  }
   return (
     <Badge variant="outline">
-      <PhoneCall className="mr-1 h-3 w-3" /> {type || "call"}
+      <PhoneCall className="mr-1 h-3 w-3" /> {t || "call"}
     </Badge>
   );
 }
@@ -262,12 +269,16 @@ export default function TransactionsPage() {
   const backfill = async () => {
     setBackfilling(true);
     try {
-      const r = await apiClient.backfillProviderIds();
+      const [r, p] = await Promise.all([
+        apiClient.backfillProviderIds(),
+        apiClient.backfillPurposes(),
+      ]);
       const bits = [
         `${r.updated_calls} calls`,
         `${r.updated_orders} orders`,
       ];
       if (r.updated_customers) bits.push(`${r.updated_customers} customer details`);
+      if (p.updated) bits.push(`${p.updated} call purposes`);
       toast.success(`Backfilled ${bits.join(", ")}`);
       load();
     } catch (e) {
@@ -542,10 +553,7 @@ export default function TransactionsPage() {
                   <div className="flex flex-col items-start gap-1">
                     {s.call ? (
                       <>
-                        <TypeBadge type={s.call.call_type} purpose={s.call.call_purpose} />
-                        {s.call.call_purpose && s.call.call_purpose !== s.call.call_type && (
-                          <PurposeBadge purpose={s.call.call_purpose} />
-                        )}
+                        <CallPurposeBadge type={s.call.call_type} purpose={s.call.call_purpose} />
                         <DispositionBadge disposition={s.call.disposition} />
                       </>
                     ) : (
@@ -605,8 +613,7 @@ export default function TransactionsPage() {
                   </span>
                   {selected.call && (
                     <>
-                      <TypeBadge type={selected.call.call_type} purpose={selected.call.call_purpose} />
-                      {selected.call.call_purpose && <PurposeBadge purpose={selected.call.call_purpose} />}
+                      <CallPurposeBadge type={selected.call.call_type} purpose={selected.call.call_purpose} />
                       <DispositionBadge disposition={selected.call.disposition} />
                     </>
                   )}

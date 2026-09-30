@@ -62,15 +62,17 @@ async def call_ended(
         if payload.transcript and not (existing.transcript or []):
             existing.transcript = payload.transcript
             updated_fields.append("transcript")
-        incoming_purpose = payload.resolved_purpose()
-        if incoming_purpose and not (existing.call_purpose or "").strip():
+        incoming_purpose = payload.resolved_purpose(_payload_text(payload))
+        if incoming_purpose and (existing.call_purpose or "").strip() in ("", "general"):
             existing.call_purpose = incoming_purpose
             updated_fields.append("call_purpose")
         if payload.tool_calls and not (existing.tool_calls or []):
             existing.tool_calls = payload.tool_calls
             updated_fields.append("tool_calls")
         if not (existing.summary or "").strip():
-            new_summary = await summarize(payload.transcript, payload.tool_calls, incoming_disposition)
+            new_summary = await summarize(
+                payload.transcript, payload.tool_calls, incoming_disposition,
+                existing.call_purpose or incoming_purpose)
             if not new_summary and (payload.order_number or payload.transfer_reason):
                 new_summary = _synthesize_summary(payload)
             if new_summary:
@@ -110,7 +112,12 @@ async def call_ended(
     if provider == "genesys" and not provider_call_id:
         provider_call_id = genesys_id
 
-    summary = await summarize(payload.transcript, payload.tool_calls, disposition)
+    _purpose_text = _payload_text(payload)
+    _webhook_purpose = payload.resolved_purpose(_purpose_text)
+
+    summary = await summarize(
+        payload.transcript, payload.tool_calls, disposition,
+        _webhook_purpose)
     if not summary and (payload.order_number or payload.transfer_reason):
         summary = _synthesize_summary(payload)
 
@@ -144,7 +151,7 @@ async def call_ended(
         genesys_conversation_id=genesys_id,
         provider=provider,
         provider_call_id=provider_call_id,
-        call_purpose=payload.resolved_purpose(),
+        call_purpose=_webhook_purpose,
     )
     db.add(call)
 
@@ -161,6 +168,15 @@ async def call_ended(
         email = payload.resolved_email()
         if email:
             cust.email = cust.email or email
+        _purpose_to_intent = {
+            "order_creation": "order_placement",
+            "order_status": "order_status_check",
+            "reservation": "reservation",
+            "general": "general_inquiry",
+        }
+        _p = (_webhook_purpose or "").strip()
+        if _p in _purpose_to_intent:
+            cust.last_intent = _purpose_to_intent[_p]
         vec = await embed_one(f"Call summary: {summary}")
         db.add(Memory(customer_id=cust.id, kind="call_summary", text=summary, embedding=vec))
 
@@ -196,8 +212,8 @@ async def call_ended(
                 if (enabled and api_key and text.strip()) else None
             )
             if result is not None:
-                if not (call.call_purpose or "").strip():
-                    call.call_purpose = result["purpose"] or payload.resolved_purpose()
+                if (call.call_purpose or "").strip() in ("", "general"):
+                    call.call_purpose = result["purpose"] or _webhook_purpose
                 req = result["req"]
                 if req is not None:
                     if existing:
@@ -207,8 +223,10 @@ async def call_ended(
                         order = await build_order_from_req(
                             db, req, list(result["missing"] or []), text,
                             call, customer_name, customer_phone, call_id)
-            elif not (call.call_purpose or "").strip():
-                call.call_purpose = payload.resolved_purpose() or "general"
+            elif not (call.call_purpose or "").strip() and _webhook_purpose:
+                # No LLM result: keep the flag/keyword purpose; never invent
+                # "general" — unknown stays empty until the classifier runs.
+                call.call_purpose = _webhook_purpose
         except Exception as e:
             logger.warning(f"call {call_id!r}: extraction failed ({e})")
             order = None
@@ -244,7 +262,7 @@ async def _materialize_order(
     order = (
         await db.execute(select(Order).where(Order.order_number == p.order_number))
     ).scalar_one_or_none()
-    purpose = p.resolved_purpose()
+    purpose = p.resolved_purpose(_payload_text(p))
     if purpose == "reservation":
         return None
     if order is None:
@@ -311,6 +329,17 @@ async def _materialize_order(
     db.add(OrderEvent(order_id=order.id, status="confirmed",
                       note="Order recorded from post-call summary"))
     return order
+
+
+def _payload_text(p: CallEndedWebhook) -> str:
+    """Flat transcript text for keyword fallbacks (purpose classification)."""
+    parts: list[str] = []
+    for t in p.transcript or []:
+        if isinstance(t, dict):
+            c = t.get("content") or t.get("text") or ""
+            if c:
+                parts.append(f"{t.get('role', 'unknown')}: {c}")
+    return "\n".join(parts)
 
 
 def _parse_items(order_items: Any) -> list[dict]:

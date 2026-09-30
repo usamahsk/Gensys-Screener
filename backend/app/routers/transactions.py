@@ -339,3 +339,72 @@ async def backfill_provider_ids(db: AsyncSession = Depends(get_db)):
     await db.commit()
     return {"updated_calls": updated_calls, "updated_orders": updated_orders,
             "updated_customers": updated_customers, "runs_scanned": runs_scanned}
+
+
+_TYPE_TO_PURPOSE = {"create_order": "order_creation",
+                    "order_status": "order_status",
+                    "reservation": "reservation"}
+
+_RESERVATION_KW = ("book a table", "reserve a table", "reservation",
+                   "table for ", "party of ", "party size")
+_STATUS_KW = ("order status", "status of my order", "status check",
+              "where is my order", "is my order", "track my order",
+              "cancel my order", "how long for my order")
+
+
+def _infer_call_purpose(c: Call) -> str:
+    """Deterministic purpose for backfill (no LLM): tool type is ground
+    truth, then tool names, then linked orders, then transcript keywords."""
+    typed = _TYPE_TO_PURPOSE.get((c.call_type or "").strip(), "")
+    if typed:
+        return typed
+    for t in c.tool_calls or []:
+        if isinstance(t, dict):
+            n = str(t.get("name", "") or t.get("tool", "")).lower()
+            if "reserv" in n or "book" in n or "table" in n:
+                return "reservation"
+            if "status" in n or "track" in n or "lookup" in n:
+                return "order_status"
+            if "order" in n or "create" in n:
+                return "order_creation"
+    if c.order_numbers:
+        return "order_creation"
+    blob = " ".join(
+        str((t.get("content") or t.get("text") or "")) if isinstance(t, dict) else str(t or "")
+        for t in c.transcript or []
+    ).lower()
+    if blob:
+        if any(k in blob for k in _RESERVATION_KW):
+            return "reservation"
+        if any(k in blob for k in _STATUS_KW):
+            return "order_status"
+    return ""
+
+
+@router.post("/backfill-purposes", response_model=dict)
+async def backfill_purposes(db: AsyncSession = Depends(get_db)):
+    """Repair call_purpose on old rows.
+
+    - Empty/"general" purposes are inferred (tool type → tool names →
+      linked orders → transcript keywords).
+    - Rows whose tool type disagrees with the stored purpose (e.g. an
+      order_status call tagged order_creation from a bare order-number
+      echo) are realigned to the tool type, which is ground truth.
+    Returns {scanned, updated}.
+    """
+    calls = (await db.execute(select(Call))).scalars().all()
+    updated = 0
+    for c in calls:
+        current = (c.call_purpose or "").strip()
+        typed = _TYPE_TO_PURPOSE.get((c.call_type or "").strip(), "")
+        if typed and current != typed:
+            # Tool type wins — fixes echo-bug mistags and empty tags alike.
+            c.call_purpose = typed
+            updated += 1
+        elif current in ("", "general"):
+            inferred = _infer_call_purpose(c)
+            if inferred and inferred != current:
+                c.call_purpose = inferred
+                updated += 1
+    await db.commit()
+    return {"scanned": len(calls), "updated": updated}

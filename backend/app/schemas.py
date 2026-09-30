@@ -789,12 +789,17 @@ class CallEndedWebhook(BaseModel):
     def resolved_recording_url(self) -> str:
         return self.recording_url or self.user_recording_url or self.bot_recording_url
 
-    def resolved_purpose(self) -> str:
+    def resolved_purpose(self, transcript_text: str = "") -> str:
         """Best-effort purpose from webhook flags (before transcript AI runs).
 
-        reservation_completed/confirmed → reservation; an order_status-ish
-        tool call in tool_calls → order_status; order fields present →
-        order_creation; else "" (let the transcript classifier decide).
+        reservation_completed/confirmed → reservation; reservation/status-ish
+        tool call → that purpose; creation evidence (completed/confirmed
+        flags, items, total) → order_creation; transcript keywords as a
+        last resort. Returns "" when unknown — callers must NOT fabricate
+        "general" (the LLM classifier owns that label).
+
+        NOTE: a bare echoed order_number alone is NOT creation evidence —
+        status-check webhooks echo the number being asked about.
         """
         if self.reservation_completed or self.reservation_confirmed:
             return "reservation"
@@ -807,8 +812,25 @@ class CallEndedWebhook(BaseModel):
                     return "order_status"
                 if "order" in n or "create" in n:
                     return "order_creation"
-        if self.order_number or self.order_completed or self.order_confirmed:
+        if self.order_completed or self.order_confirmed:
             return "order_creation"
+        try:
+            from app.routers.webhooks import _parse_items as _parse_webhook_items
+            has_items = bool(_parse_webhook_items(self.order_items))
+        except Exception:
+            has_items = bool(self.order_items)
+        if has_items or (self.total_price or 0):
+            return "order_creation"
+        kw = (transcript_text or "").lower()
+        if kw:
+            if any(k in kw for k in ("book a table", "reserve a table", "reservation",
+                                     "table for ", "party of ", "party size")):
+                return "reservation"
+            if any(k in kw for k in ("order status", "status of my order",
+                                     "where is my order", "is my order",
+                                     "track my order", "cancel my order",
+                                     "how long for my order")):
+                return "order_status"
         return ""
 
 

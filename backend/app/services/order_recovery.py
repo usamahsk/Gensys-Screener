@@ -92,8 +92,13 @@ _NON_ORDER_PURPOSES = ("order_status", "reservation")
 INCOMPLETE_STATUS = "incomplete"
 
 
-def _normalize_purpose(raw: object, data: dict | None = None, text: str = "") -> str:
-    """LLM purpose → canonical value, with keyword fallback."""
+def _normalize_purpose(raw: object, data: dict | None = None, text: str = "",
+                     order_json: bool = False) -> str:
+    """LLM purpose → canonical value, with keyword fallback.
+
+    When the model returned an order JSON (order_json=True) but omitted the
+    purpose, it is an order_creation attempt by construction — never "general".
+    """
     s = (str(raw or "").strip().lower().replace("-", "_").replace(" ", "_"))
     aliases = {
         "create_order": "order_creation", "new_order": "order_creation",
@@ -105,18 +110,18 @@ def _normalize_purpose(raw: object, data: dict | None = None, text: str = "") ->
     s = aliases.get(s, s)
     if s in CALL_PURPOSES:
         return s
-    # no_order without an explicit purpose → infer from reason text
+    # No explicit purpose → infer from reason + transcript text.
     blob = f"{((data or {}).get('reason') or '')} {text or ''}".lower()
     if any(k in blob for k in ("reserv", "book a table", "party size", "table for")):
         return "reservation"
-    if any(k in blob for k in ("where is my order", "order status", "is my order",
-                               "track my order", "cancel my order", "order number",
-                               "order id", "pb-")) and "order" in blob:
-        # careful: PB- codes also appear in creations; default creation wins
-        # unless status-ish verbs dominate
-        if any(k in blob for k in ("status", "where", "ready", "cancel", "track",
-                                   "how long", "delayed")):
-            return "order_status"
+    if any(k in blob for k in ("order status", "status of my order", "status check",
+                               "where is my order", "is my order", "track my order",
+                               "cancel my order", "how long for my order")):
+        return "order_status"
+    if order_json:
+        # An order payload IS an order attempt (even partial) — the prompt
+        # reserves no_order for status/reservation/general.
+        return "order_creation"
     return "general"
 
 
@@ -420,11 +425,10 @@ async def analyze_transcript(text: str, api_key: str, model: str) -> dict:
         logger.warning(f"order_recovery: Gemini JSON failed validation: {e}")
         return {"req": None, "purpose": purpose, "missing": [],
                 "no_order": True, "reason": "validation"}
-    if not req.call_purpose:
-        req.call_purpose = purpose
-    else:
-        purpose = _normalize_purpose(req.call_purpose, data, text)
-        req.call_purpose = purpose
+    # Order JSON without an explicit purpose is an order_creation attempt.
+    purpose = _normalize_purpose(req.call_purpose or data.get("call_purpose"),
+                                 data, text, order_json=True)
+    req.call_purpose = purpose
     if purpose in _NON_ORDER_PURPOSES:
         logger.info(f"order_recovery: {purpose} call — tagging only, no order row")
         return {"req": None, "purpose": purpose, "missing": [],
@@ -535,7 +539,7 @@ async def create_order_from_transcript(
     result = await analyze_transcript(text, api_key, model)
     purpose = result["purpose"]
     try:
-        if not (call.call_purpose or "").strip():
+        if (call.call_purpose or "").strip() in ("", "general") and purpose:
             call.call_purpose = purpose
     except Exception:
         pass
@@ -646,7 +650,7 @@ async def recover_order_from_call(call_id: str, order_number: str | None = None)
 
         result = await analyze_transcript(text, api_key, g.model or "gemini-3.5-flash")
         purpose = result["purpose"]
-        if not (call.call_purpose or "").strip():
+        if (call.call_purpose or "").strip() in ("", "general") and purpose:
             call.call_purpose = purpose
         req = result["req"]
         if req is None:

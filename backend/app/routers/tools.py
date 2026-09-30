@@ -81,6 +81,11 @@ async def _log_tool_call(
     call_id = (call_id or "").strip()
     if not call_id:
         return None
+    if not (call_purpose or "").strip():
+        # Older callers only send call_type — derive the filter purpose.
+        call_purpose = {"create_order": "order_creation",
+                        "order_status": "order_status",
+                        "reservation": "reservation"}.get((call_type or "").strip(), "")
     try:
         duration = int(duration or 0)
     except (ValueError, TypeError):
@@ -117,7 +122,7 @@ async def _log_tool_call(
     # update existing row with anything new the tool call carried
     if call_type and not call.call_type:
         call.call_type = call_type
-    if call_purpose and not (call.call_purpose or "").strip():
+    if call_purpose and (call.call_purpose or "").strip() in ("", "general"):
         call.call_purpose = call_purpose
     if customer_name and not call.customer_name:
         call.customer_name = customer_name
@@ -354,6 +359,13 @@ async def order_status(
         customer_name=result.order.customer_name if result.found and result.order else "",
         customer_phone=result.order.customer_phone if result.found and result.order else "",
     )
+    if result.found and result.order and result.order.customer_phone:
+        # Tag the looked-up customer's intent for the memory endpoint.
+        _cust = (await db.execute(
+            select(Customer).where(Customer.phone == result.order.customer_phone)
+        )).scalar_one_or_none()
+        if _cust is not None and not (_cust.last_intent or "").strip():
+            _cust.last_intent = "order_status_check"
     await db.commit()
     return result
 
@@ -391,6 +403,12 @@ async def order_status_query(
         customer_name=result.order.customer_name if result.found and result.order else "",
         customer_phone=result.order.customer_phone if result.found and result.order else "",
     )
+    if result.found and result.order and result.order.customer_phone:
+        _cust = (await db.execute(
+            select(Customer).where(Customer.phone == result.order.customer_phone)
+        )).scalar_one_or_none()
+        if _cust is not None and not (_cust.last_intent or "").strip():
+            _cust.last_intent = "order_status_check"
     await db.commit()
     return result
 
@@ -459,6 +477,16 @@ async def log_reservation(req: ReservationLogRequest, db: AsyncSession = Depends
         provider=tmp.resolved_provider(),
         provider_call_id=tmp.resolved_provider_call_id(),
     )
+    _phone = clean_str(req.customer_phone)
+    if _phone:
+        _cust = (await db.execute(
+            select(Customer).where(Customer.phone == _phone))).scalar_one_or_none()
+        if _cust is None:
+            _cust = Customer(phone=_phone, name=clean_str(req.customer_name))
+            db.add(_cust)
+            await db.flush()
+        _cust.last_intent = "reservation"
+        await _add_memory(db, _cust, "note", f"Reservation call: {summary}.")
     await db.commit()
     return {"status": "recorded", "call_id": call_id, "call_purpose": "reservation"}
 
