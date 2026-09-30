@@ -131,6 +131,11 @@ class OrderCreateRequest(BaseModel):
     # acknowledged it. no_order: status check / reservation / incomplete call.
     order_confirmed: bool = False
     no_order: bool = False
+    # Call-purpose classification from the transcript classifier:
+    # order_creation | order_status | reservation | general. Also accepted on
+    # tool calls (ignored) so one schema fits both paths.
+    call_purpose: str = ""
+    missing_fields: list[str] = []
     # --- Voice-platform provider + telephony id (Dograh flavour of Genesys id) ---
     provider: Optional[str] = ""
     provider_call_id: Optional[str] = ""
@@ -251,6 +256,36 @@ class OrderCreateRequest(BaseModel):
     @classmethod
     def _coerce_flags(cls, v: Any) -> Any:
         return coerce_bool(v) if not isinstance(v, bool) else v
+
+    @field_validator("call_purpose", mode="before")
+    @classmethod
+    def _coerce_purpose(cls, v: Any) -> Any:
+        if v in (None, "") or is_unresolved_template(v):
+            return ""
+        s = str(v).strip().lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "create_order": "order_creation", "order_creation": "order_creation",
+            "new_order": "order_creation", "place_order": "order_creation",
+            "order": "order_creation",
+            "order_status": "order_status", "order_status_check": "order_status",
+            "status_check": "order_status", "track_order": "order_status",
+            "reservation": "reservation", "table_booking": "reservation",
+            "book_table": "reservation", "booking": "reservation",
+        }
+        if s in aliases:
+            return aliases[s]
+        return s if s in ("order_creation", "order_status", "reservation", "general") else ""
+
+    @field_validator("missing_fields", mode="before")
+    @classmethod
+    def _coerce_missing(cls, v: Any) -> Any:
+        if v in (None, "") or is_unresolved_template(v):
+            return []
+        if isinstance(v, str):
+            return [v.strip()] if v.strip() else []
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return []
 
     @field_validator("customer_name", "customer_phone", "email", "table_number",
                      "pickup_time", "delivery_address", "payment_method",
@@ -754,6 +789,28 @@ class CallEndedWebhook(BaseModel):
     def resolved_recording_url(self) -> str:
         return self.recording_url or self.user_recording_url or self.bot_recording_url
 
+    def resolved_purpose(self) -> str:
+        """Best-effort purpose from webhook flags (before transcript AI runs).
+
+        reservation_completed/confirmed → reservation; an order_status-ish
+        tool call in tool_calls → order_status; order fields present →
+        order_creation; else "" (let the transcript classifier decide).
+        """
+        if self.reservation_completed or self.reservation_confirmed:
+            return "reservation"
+        for t in self.tool_calls or []:
+            if isinstance(t, dict):
+                n = str(t.get("name", "") or t.get("tool", "")).lower()
+                if "reserv" in n or "book" in n or "table" in n:
+                    return "reservation"
+                if "status" in n or "track" in n or "lookup" in n:
+                    return "order_status"
+                if "order" in n or "create" in n:
+                    return "order_creation"
+        if self.order_number or self.order_completed or self.order_confirmed:
+            return "order_creation"
+        return ""
+
 
 class TransferWebhook(BaseModel):
     """Mid-call escalation handoff (Dograh -> app).
@@ -859,6 +916,7 @@ class TransferContextResponse(BaseModel):
 class CallOut(BaseModel):
     call_id: str
     call_type: str = ""
+    call_purpose: str = ""
     disposition: str
     started_at: datetime
     duration_seconds: int

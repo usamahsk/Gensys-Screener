@@ -2,10 +2,11 @@
 
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from loguru import logger
+from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -67,11 +68,15 @@ async def _log_tool_call(
     tool_summary: str = "",
     provider: str = "",
     provider_call_id: str = "",
+    call_purpose: str = "",
 ) -> Call | None:
     """Create or update the Call Logs row for this tool call.
 
-    Every create_order / order_status call with a call_id lands here so the
-    dashboard's Call Logs section shows one row per call with its type.
+    Every create_order / order_status / reservation call with a call_id lands
+    here so the dashboard's Call Logs section shows one row per call with its
+    type. `call_purpose` (order_creation | order_status | reservation |
+    general) is the filter dimension — order_status / reservation calls never
+    create an order row.
     """
     call_id = (call_id or "").strip()
     if not call_id:
@@ -87,6 +92,7 @@ async def _log_tool_call(
         call = Call(
             call_id=call_id,
             call_type=call_type,
+            call_purpose=call_purpose or "",
             disposition="completed",
             started_at=datetime.now(timezone.utc) - timedelta(seconds=duration),
             ended_at=datetime.now(timezone.utc),
@@ -111,6 +117,8 @@ async def _log_tool_call(
     # update existing row with anything new the tool call carried
     if call_type and not call.call_type:
         call.call_type = call_type
+    if call_purpose and not (call.call_purpose or "").strip():
+        call.call_purpose = call_purpose
     if customer_name and not call.customer_name:
         call.customer_name = customer_name
     if customer_phone and not call.customer_phone:
@@ -171,6 +179,7 @@ async def create_order(
             db,
             call_id=req.resolved_call_id(),
             call_type="create_order",
+            call_purpose="order_creation",
             customer_name=req.customer_name.strip(),
             customer_phone=req.customer_phone.strip(),
             first_name=req.resolved_first_name(),
@@ -274,6 +283,7 @@ async def create_order(
         db,
         call_id=req.resolved_call_id(),
         call_type="create_order",
+        call_purpose="order_creation",
         customer_name=order.customer_name,
         customer_phone=order.customer_phone,
         first_name=req.resolved_first_name(),
@@ -330,6 +340,7 @@ async def order_status(
         db,
         call_id=call_id or "",
         call_type="order_status",
+        call_purpose="order_status",
         first_name=clean_str(first_name),
         rsvp=clean_str(rsvp),
         duration=_coerce_int(duration),
@@ -366,6 +377,7 @@ async def order_status_query(
         db,
         call_id=call_id or "",
         call_type="order_status",
+        call_purpose="order_status",
         first_name=clean_str(first_name),
         rsvp=clean_str(rsvp),
         duration=_coerce_int(duration),
@@ -381,6 +393,74 @@ async def order_status_query(
     )
     await db.commit()
     return result
+
+
+# --------------------------------------------------------------- reservation
+
+class ReservationLogRequest(BaseModel):
+    call_id: str = ""
+    workflow_run_id: str = ""
+    customer_name: str = ""
+    customer_phone: str = ""
+    first_name: str = ""
+    rsvp: str = ""
+    party_size: Optional[int] = None
+    reservation_date: str = ""
+    reservation_time: str = ""
+    duration: Optional[Any] = 0
+    duration_seconds: Optional[Any] = 0
+    recording_url: str = ""
+    user_recording_url: str = ""
+    bot_recording_url: str = ""
+    transcript_url: str = ""
+    provider: str = ""
+    provider_call_id: str = ""
+    telephony_id: str = ""
+
+
+@router.post("/reservations", status_code=201)
+async def log_reservation(req: ReservationLogRequest, db: AsyncSession = Depends(get_db)):
+    """Log a reservation / table-booking call. Creates NO order row — it only
+    tags the Call with purpose=reservation so it can be filtered separately
+    from order_creation and order_status calls."""
+    from app.schemas import OrderCreateRequest as _OCR
+
+    call_id = (req.call_id or req.workflow_run_id or "").strip()
+    # Reuse OrderCreateRequest resolvers for provider/duration cleaning.
+    tmp = _OCR.model_validate({
+        "call_id": call_id, "first_name": req.first_name, "rsvp": req.rsvp,
+        "duration": req.duration, "duration_seconds": req.duration_seconds,
+        "recording_url": req.recording_url,
+        "user_recording_url": req.user_recording_url,
+        "bot_recording_url": req.bot_recording_url,
+        "transcript_url": req.transcript_url, "provider": req.provider,
+        "provider_call_id": req.provider_call_id, "telephony_id": req.telephony_id,
+    })
+    bits = []
+    if req.party_size:
+        bits.append(f"party of {req.party_size}")
+    if req.reservation_date:
+        bits.append(req.reservation_date)
+    if req.reservation_time:
+        bits.append(req.reservation_time)
+    summary = f"Reservation {' '.join(bits)}".strip() or "Reservation noted"
+    await _log_tool_call(
+        db, call_id=call_id, call_type="reservation",
+        call_purpose="reservation",
+        customer_name=clean_str(req.customer_name),
+        customer_phone=clean_str(req.customer_phone),
+        first_name=tmp.resolved_first_name(), rsvp=clean_str(req.rsvp),
+        duration=tmp.resolved_duration(),
+        recording_url=clean_str(req.recording_url),
+        user_recording_url=clean_str(req.user_recording_url),
+        bot_recording_url=clean_str(req.bot_recording_url),
+        transcript_url=clean_str(req.transcript_url),
+        tool_name="reservation", tool_summary=summary,
+        provider=tmp.resolved_provider(),
+        provider_call_id=tmp.resolved_provider_call_id(),
+    )
+    await db.commit()
+    return {"status": "recorded", "call_id": call_id, "call_purpose": "reservation"}
 
 
 def _coerce_int(v: object) -> int:

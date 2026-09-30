@@ -37,6 +37,7 @@ def _call_dict(c: Call) -> dict:
     return {
         "call_id": c.call_id,
         "call_type": c.call_type or "",
+        "call_purpose": c.call_purpose or "",
         "disposition": c.disposition,
         "started_at": c.started_at.isoformat() if c.started_at else None,
         "duration_seconds": c.duration_seconds,
@@ -83,13 +84,20 @@ def _order_summary(o: Order) -> dict:
 @router.get("")
 async def list_sessions(
     disposition: Optional[str] = None,
+    purpose: Optional[str] = None,
+    order_status: Optional[str] = None,
     search: Optional[str] = None,
     limit: int = Query(default=100, le=200),
     db: AsyncSession = Depends(get_db),
 ):
+    """List transactions. Filters: `purpose` = call intent (order_creation |
+    order_status | reservation | general); `order_status` = linked-order
+    status incl. `incomplete` (sessions whose linked order has that status)."""
     cq = select(Call).order_by(Call.started_at.desc()).limit(limit)
     if disposition:
         cq = cq.where(Call.disposition == disposition)
+    if purpose:
+        cq = cq.where(Call.call_purpose == purpose.strip())
     if search:
         like = f"%{search.strip()}%"
         cq = cq.where(
@@ -139,6 +147,10 @@ async def list_sessions(
     transactions = []
     for c in calls:
         linked = [orders_by_number[n] for n in (c.order_numbers or []) if n in orders_by_number]
+        if order_status:
+            want = order_status.strip()
+            if not any(o.status == want for o in linked):
+                continue
         transactions.append({
             "key": f"call:{c.call_id}",
             "started_at": c.started_at.isoformat() if c.started_at else "",
@@ -146,6 +158,8 @@ async def list_sessions(
             "orders": [_order_summary(o) for o in linked],
         })
     for o in orphans:
+        if order_status and o.status != order_status.strip():
+            continue
         transactions.append({
             "key": f"order:{o.order_number}",
             "started_at": o.created_at.isoformat() if o.created_at else "",

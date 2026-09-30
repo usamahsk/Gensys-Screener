@@ -62,6 +62,10 @@ async def call_ended(
         if payload.transcript and not (existing.transcript or []):
             existing.transcript = payload.transcript
             updated_fields.append("transcript")
+        incoming_purpose = payload.resolved_purpose()
+        if incoming_purpose and not (existing.call_purpose or "").strip():
+            existing.call_purpose = incoming_purpose
+            updated_fields.append("call_purpose")
         if payload.tool_calls and not (existing.tool_calls or []):
             existing.tool_calls = payload.tool_calls
             updated_fields.append("tool_calls")
@@ -140,6 +144,7 @@ async def call_ended(
         genesys_conversation_id=genesys_id,
         provider=provider,
         provider_call_id=provider_call_id,
+        call_purpose=payload.resolved_purpose(),
     )
     db.add(call)
 
@@ -161,16 +166,17 @@ async def call_ended(
 
     order = await _materialize_order(db, payload, customer_name, customer_phone, call_id)
     if order is None and call_id and call_id != "unknown":
-        # STRAIGHT PATH: transcript arrives in this request body → extract via
-        # Gemini NOW and create the order. Nothing is saved on failure — the
-        # UI only ever shows real, extracted orders.
+        # STRAIGHT PATH: transcript arrives in this request body → classify
+        # via Gemini NOW. order_status / reservation / general only tags the
+        # call purpose (no row); order_creation always creates a row —
+        # `confirmed` when complete, `incomplete` when fields are missing.
         try:
             from app.services.order_recovery import (
                 _apply_extraction,
                 _download_text,
                 _transcript_text,
-                create_order_from_transcript,
-                extract_request_from_text,
+                analyze_transcript,
+                build_order_from_req,
                 get_google_key,
             )
             existing = (
@@ -185,17 +191,24 @@ async def call_ended(
             if not text and payload.transcript_url:
                 text = await _download_text(payload.transcript_url)
             api_key, model, enabled = await get_google_key(db)
-            req = (
-                await extract_request_from_text(text, api_key, model)
+            result = (
+                await analyze_transcript(text, api_key, model)
                 if (enabled and api_key and text.strip()) else None
             )
-            if req is not None:
-                if existing:
-                    _apply_extraction(existing, req, call, shell_empty=not existing.items)
-                    order = existing
-                else:
-                    order = await create_order_from_transcript(
-                        db, text, call, customer_name, customer_phone, call_id)
+            if result is not None:
+                if not (call.call_purpose or "").strip():
+                    call.call_purpose = result["purpose"] or payload.resolved_purpose()
+                req = result["req"]
+                if req is not None:
+                    if existing:
+                        _apply_extraction(existing, req, call, shell_empty=not existing.items)
+                        order = existing
+                    else:
+                        order = await build_order_from_req(
+                            db, req, list(result["missing"] or []), text,
+                            call, customer_name, customer_phone, call_id)
+            elif not (call.call_purpose or "").strip():
+                call.call_purpose = payload.resolved_purpose() or "general"
         except Exception as e:
             logger.warning(f"call {call_id!r}: extraction failed ({e})")
             order = None
@@ -218,12 +231,32 @@ async def call_ended(
 async def _materialize_order(
     db: AsyncSession, p: CallEndedWebhook, customer_name: str, customer_phone: str, call_id: str
 ) -> Order | None:
-    """Create/update an order row when the post-call payload carries one."""
+    """Create/update an order row when the post-call payload carries one.
+
+    Segregation guard: reservation calls and pure order_status checks never
+    mint an order row here. A status check only touches the row when it
+    already exists (link/call_id backfill); otherwise it returns None and the
+    transcript classifier tags the Call purpose instead. Real creations (or
+    the classifier's incomplete path) still create the row.
+    """
     if not p.order_number:
         return None
     order = (
         await db.execute(select(Order).where(Order.order_number == p.order_number))
     ).scalar_one_or_none()
+    purpose = p.resolved_purpose()
+    if purpose == "reservation":
+        return None
+    if order is None:
+        if purpose == "order_status":
+            return None
+        has_items = bool(_parse_items(p.order_items))
+        if not (p.order_completed or p.order_confirmed or has_items or p.total_price):
+            # Bare order_number echo with no creation evidence (typical of a
+            # status-check webhook) — do NOT mint a row; the transcript
+            # classifier decides (creation → confirmed/incomplete, status →
+            # tag-only).
+            return None
     order_type = "takeaway"
     ft = (p.fulfillment_type or "").lower()
     if ft in ("dinein", "dine_in", "dine-in"):

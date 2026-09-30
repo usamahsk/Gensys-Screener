@@ -54,7 +54,9 @@ import {
 
 const DISPOSITIONS = ["completed", "transferred", "failed", "abandoned"];
 
-const STATUSES = ["confirmed", "preparing", "ready", "in_transit", "completed", "cancelled"];
+const PURPOSES = ["order_creation", "order_status", "reservation", "general"];
+
+const STATUSES = ["confirmed", "preparing", "ready", "in_transit", "completed", "cancelled", "incomplete"];
 
 function statusClass(s: string) {
   const map: Record<string, string> = {
@@ -64,11 +66,34 @@ function statusClass(s: string) {
     in_transit: "bg-cyan-100 text-cyan-800",
     completed: "bg-green-100 text-green-800",
     cancelled: "bg-red-100 text-red-800",
+    incomplete: "bg-orange-100 text-orange-800",
   };
   return map[s] || "bg-gray-100 text-gray-700";
 }
 
-function TypeBadge({ type }: { type: string }) {
+function PurposeBadge({ purpose }: { purpose: string }) {
+  if (!purpose) return null;
+  const map: Record<string, string> = {
+    order_creation: "bg-[#0068FF] text-white hover:bg-[#0057DC]",
+    order_status: "bg-cyan-100 text-cyan-900 hover:bg-cyan-100",
+    reservation: "bg-violet-100 text-violet-900 hover:bg-violet-100",
+    general: "bg-gray-100 text-gray-700 hover:bg-gray-100",
+  };
+  return (
+    <Badge variant="secondary" className={map[purpose] || "bg-gray-100 text-gray-700"}>
+      {purpose.replace("_", " ")}
+    </Badge>
+  );
+}
+
+function TypeBadge({ type, purpose }: { type: string; purpose?: string }) {
+  if (purpose === "reservation" || type === "reservation") {
+    return (
+      <Badge variant="secondary" className="bg-violet-100 text-violet-900 hover:bg-violet-100">
+        <FileText className="mr-1 h-3 w-3" /> reservation
+      </Badge>
+    );
+  }
   if (type === "create_order") {
     return (
       <Badge className="bg-[#0068FF] text-white hover:bg-[#0057DC]">
@@ -76,7 +101,7 @@ function TypeBadge({ type }: { type: string }) {
       </Badge>
     );
   }
-  if (type === "order_status") {
+  if (type === "order_status" || purpose === "order_status") {
     return (
       <Badge variant="secondary" className="bg-cyan-100 text-cyan-900 hover:bg-cyan-100">
         <FileText className="mr-1 h-3 w-3" /> order status
@@ -194,6 +219,8 @@ export default function TransactionsPage() {
   const [sessions, setSessions] = useState<TransactionRow[]>([]);
   const [search, setSearch] = useState("");
   const [disposition, setDisposition] = useState("all");
+  const [purpose, setPurpose] = useState("all");
+  const [orderStatus, setOrderStatus] = useState("all");
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -210,6 +237,8 @@ export default function TransactionsPage() {
     try {
       const data = await apiClient.transactions({
         disposition: disposition === "all" ? undefined : disposition,
+        purpose: purpose === "all" ? undefined : purpose,
+        order_status: orderStatus === "all" ? undefined : orderStatus,
         search: search.trim() || undefined,
       });
       setSessions(data.transactions);
@@ -219,7 +248,7 @@ export default function TransactionsPage() {
     } finally {
       setLoading(false);
     }
-  }, [disposition, search]);
+  }, [disposition, purpose, orderStatus, search]);
 
   useEffect(() => {
     const t = setTimeout(load, search ? 400 : 0);
@@ -228,7 +257,7 @@ export default function TransactionsPage() {
 
   useEffect(() => {
     setPage(1);
-  }, [disposition, search]);
+  }, [disposition, purpose, orderStatus, search]);
 
   const backfill = async () => {
     setBackfilling(true);
@@ -444,6 +473,28 @@ export default function TransactionsPage() {
             ))}
           </SelectContent>
         </Select>
+        <Select value={purpose} onValueChange={setPurpose}>
+          <SelectTrigger className="w-48">
+            <SelectValue placeholder="All purposes" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All purposes</SelectItem>
+            {PURPOSES.map((p) => (
+              <SelectItem key={p} value={p}>{p.replace("_", " ")}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <Select value={orderStatus} onValueChange={setOrderStatus}>
+          <SelectTrigger className="w-48">
+            <SelectValue placeholder="All order statuses" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All order statuses</SelectItem>
+            {STATUSES.map((s) => (
+              <SelectItem key={s} value={s}>{s.replace("_", " ")}</SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
         <span className="text-sm text-muted-foreground">{sessions.length} transactions</span>
       </div>
 
@@ -491,7 +542,10 @@ export default function TransactionsPage() {
                   <div className="flex flex-col items-start gap-1">
                     {s.call ? (
                       <>
-                        <TypeBadge type={s.call.call_type} />
+                        <TypeBadge type={s.call.call_type} purpose={s.call.call_purpose} />
+                        {s.call.call_purpose && s.call.call_purpose !== s.call.call_type && (
+                          <PurposeBadge purpose={s.call.call_purpose} />
+                        )}
                         <DispositionBadge disposition={s.call.disposition} />
                       </>
                     ) : (
@@ -551,7 +605,8 @@ export default function TransactionsPage() {
                   </span>
                   {selected.call && (
                     <>
-                      <TypeBadge type={selected.call.call_type} />
+                      <TypeBadge type={selected.call.call_type} purpose={selected.call.call_purpose} />
+                      {selected.call.call_purpose && <PurposeBadge purpose={selected.call.call_purpose} />}
                       <DispositionBadge disposition={selected.call.disposition} />
                     </>
                   )}

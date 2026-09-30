@@ -60,6 +60,7 @@ export interface OrderDetail extends OrderRow {
 export interface CallRow {
   call_id: string;
   call_type: string;
+  call_purpose: string;
   disposition: string;
   started_at: string;
   duration_seconds: number;
@@ -209,9 +210,9 @@ export interface Analytics {
 
 export const apiClient = {
   analytics: () => api<Analytics>("/api/analytics/summary"),
-  orders: (params?: { status?: string; search?: string; order_type?: string }) => {
+  orders: (params?: { status?: string; search?: string; order_type?: string; source?: string; exclude_incomplete?: boolean }) => {
     const qs = new URLSearchParams(
-      Object.entries(params || {}).filter(([, v]) => v) as [string, string][]
+      Object.entries(params || {}).filter(([, v]) => v !== undefined && v !== "" && v !== false) as [string, string][]
     );
     return api<OrderRow[]>(`/api/orders?${qs}`);
   },
@@ -287,7 +288,7 @@ export const apiClient = {
       method: "PUT",
       body: JSON.stringify(payload),
     }),
-  calls: (params?: { disposition?: string; call_type?: string; search?: string }) => {
+  calls: (params?: { disposition?: string; call_type?: string; purpose?: string; search?: string }) => {
     const qs = new URLSearchParams(
       Object.entries(params || {}).filter(([, v]) => v) as [string, string][]
     );
@@ -295,7 +296,7 @@ export const apiClient = {
     return api<CallRow[]>(`/api/calls${suffix}`);
   },
   callDetail: (callId: string) => api<CallDetail>(`/api/calls/${callId}`),
-  transactions: (params?: { disposition?: string; search?: string }) => {
+  transactions: (params?: { disposition?: string; purpose?: string; order_status?: string; search?: string }) => {
     const qs = new URLSearchParams(
       Object.entries(params || {}).filter(([, v]) => v) as [string, string][]
     );

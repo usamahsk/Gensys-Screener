@@ -28,10 +28,10 @@ async def summary(db: AsyncSession = Depends(get_db)):
         select(func.coalesce(func.avg(Call.duration_seconds), 0))
     )).scalar() or 0
     orders_created = (await db.execute(
-        select(func.count(Order.id)).where(Order.source == "voice_agent")
+        select(func.count(Order.id)).where(Order.status != "incomplete")
     )).scalar() or 0
     revenue = (await db.execute(
-        select(func.coalesce(func.sum(Order.total), 0)).where(Order.source == "voice_agent")
+        select(func.coalesce(func.sum(Order.total), 0)).where(Order.status != "incomplete")
     )).scalar() or 0
 
     # last 14 days daily series

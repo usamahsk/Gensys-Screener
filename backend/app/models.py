@@ -92,7 +92,10 @@ class Order(Base):
     delivery_address: Mapped[Optional[str]] = mapped_column(String(512), default="")
     payment_method: Mapped[Optional[str]] = mapped_column(String(32), default="")
     status: Mapped[str] = mapped_column(String(24), default="confirmed", index=True)
-    # confirmed -> preparing -> ready -> completed | cancelled
+    # confirmed -> preparing -> ready -> completed | cancelled | incomplete
+    # "incomplete" = order_creation call where the transcript/tool payload was
+    # missing something (items, name, phone, confirmation...) — saved anyway so
+    # staff can follow up; filter it out of the ready-to-fulfil list.
     total: Mapped[Decimal] = mapped_column(Numeric(10, 2), default=0)
     source: Mapped[str] = mapped_column(String(24), default="voice_agent")
     call_id: Mapped[Optional[str]] = mapped_column(String(64), default="", index=True)
@@ -177,6 +180,10 @@ class Call(Base):
     workflow_name: Mapped[Optional[str]] = mapped_column(String(128), default="")
     # create_order | order_status (tool call logs) | inbound | webhook | ...
     call_type: Mapped[Optional[str]] = mapped_column(String(16), default="")
+    # Call purpose for dashboard filtering: order_creation | order_status |
+    # reservation | general. Tagged from tool calls, webhook flags, and the
+    # transcript classifier (order-status / reservation calls create NO order).
+    call_purpose: Mapped[Optional[str]] = mapped_column(String(32), default="", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 

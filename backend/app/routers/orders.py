@@ -13,7 +13,7 @@ from app.models import Order, OrderEvent
 
 router = APIRouter(prefix="/api/orders", tags=["dashboard"])
 
-VALID_STATUSES = {"confirmed", "preparing", "ready", "in_transit", "completed", "cancelled"}
+VALID_STATUSES = {"confirmed", "preparing", "ready", "in_transit", "completed", "cancelled", "incomplete"}
 
 
 @router.get("/next-number")
@@ -29,7 +29,7 @@ async def next_order_number(db: AsyncSession = Depends(get_db)):
 
 
 class StatusUpdateRequest(BaseModel):
-    status: str = Field(pattern="^(confirmed|preparing|ready|in_transit|completed|cancelled)$")
+    status: str = Field(pattern="^(confirmed|preparing|ready|in_transit|completed|cancelled|incomplete)$")
     note: str = ""
 
 
@@ -51,14 +51,22 @@ async def list_orders(
     status: Optional[str] = None,
     order_type: Optional[str] = None,
     search: Optional[str] = None,
+    source: Optional[str] = None,
+    exclude_incomplete: bool = False,
     limit: int = Query(default=50, le=200),
     db: AsyncSession = Depends(get_db),
 ):
+    """List orders. `status=incomplete` shows only follow-up orders;
+    `exclude_incomplete=true` hides them from the fulfilment queue."""
     q = select(Order).options(selectinload(Order.items)).order_by(Order.created_at.desc()).limit(limit)
     if status:
         q = q.where(Order.status == status)
+    elif exclude_incomplete:
+        q = q.where(Order.status != "incomplete")
     if order_type:
         q = q.where(Order.order_type == order_type)
+    if source:
+        q = q.where(Order.source == source.strip())
     if search:
         like = f"%{search.strip()}%"
         q = q.where(

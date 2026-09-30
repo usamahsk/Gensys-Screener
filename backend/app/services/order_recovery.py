@@ -84,6 +84,62 @@ def _extract_phone_from_text(text: str) -> str:
 
 _FALLBACK_MODEL = "gemini-3.5-flash"
 
+# Call-purpose values used for dashboard filtering. order-status and
+# reservation calls NEVER create an order row — the purpose is tagged on the
+# Call so they can still be listed / filtered separately.
+CALL_PURPOSES = ("order_creation", "order_status", "reservation", "general")
+_NON_ORDER_PURPOSES = ("order_status", "reservation")
+INCOMPLETE_STATUS = "incomplete"
+
+
+def _normalize_purpose(raw: object, data: dict | None = None, text: str = "") -> str:
+    """LLM purpose → canonical value, with keyword fallback."""
+    s = (str(raw or "").strip().lower().replace("-", "_").replace(" ", "_"))
+    aliases = {
+        "create_order": "order_creation", "new_order": "order_creation",
+        "place_order": "order_creation", "order": "order_creation",
+        "order_status_check": "order_status", "status_check": "order_status",
+        "track_order": "order_status", "table_booking": "reservation",
+        "book_table": "reservation", "booking": "reservation",
+    }
+    s = aliases.get(s, s)
+    if s in CALL_PURPOSES:
+        return s
+    # no_order without an explicit purpose → infer from reason text
+    blob = f"{((data or {}).get('reason') or '')} {text or ''}".lower()
+    if any(k in blob for k in ("reserv", "book a table", "party size", "table for")):
+        return "reservation"
+    if any(k in blob for k in ("where is my order", "order status", "is my order",
+                               "track my order", "cancel my order", "order number",
+                               "order id", "pb-")) and "order" in blob:
+        # careful: PB- codes also appear in creations; default creation wins
+        # unless status-ish verbs dominate
+        if any(k in blob for k in ("status", "where", "ready", "cancel", "track",
+                                   "how long", "delayed")):
+            return "order_status"
+    return "general"
+
+
+def _compute_missing(req, text: str) -> list[str]:
+    """Fields absent from an order_creation attempt → saved as incomplete."""
+    missing: list[str] = []
+    if not (req.customer_name or "").strip():
+        missing.append("customer_name")
+    if not (req.customer_phone or "").strip():
+        missing.append("customer_phone")
+    if not req.items:
+        missing.append("items")
+    number = clean_str(req.order_number) or _extract_order_number_from_text(text or "")
+    if not number:
+        missing.append("order_number")
+    if not req.order_confirmed:
+        missing.append("confirmation")
+    for extra in (req.missing_fields or []):
+        e = str(extra).strip()
+        if e and e not in missing:
+            missing.append(e)
+    return missing
+
 
 def _redact_key(msg: str) -> str:
     """Strip secrets from log lines (delegates to the shared Gemini helper)."""
@@ -103,22 +159,21 @@ DRINKS: Soft Drink can (Coke/Sprite) 1.99, Soft Drink 1.5 litre bottle 3.49, Bot
 DESSERTS: Chocolate Brownie 4.49, Choco Lava Cake 4.99"""
 
 _PROMPT = """You extract a restaurant order from a phone-call transcript.
-First decide whether a NEW order was actually placed on this call.
+First classify the call purpose as one of:
+- "order_creation": the customer tried to place a NEW food order (even if incomplete).
+- "order_status": the customer asks about an existing order (where is it, is it ready, cancel or change it).
+- "reservation": table booking (party size, dates, holding a table).
+- "general": anything else (menu questions, hours, complaints, hangup with no order attempt).
 
-Return {"no_order": true, "reason": "<short reason>"} (and nothing else) when ANY of these is true:
-- Status / inquiry only: the customer asks about an existing order (where is it, is it ready, cancel or change it) and places nothing new.
-- Reservation / table booking (party size, dates, holding a table) — that is not a food order.
-- Transferred, hung up, or otherwise incomplete: the order was never confirmed (see below).
-- Menu questions, prices, hours, complaints — with no new order confirmed.
-- The agent only SUGGESTED items but the customer never said yes.
+Return {"no_order": true, "call_purpose": "<one of the four>", "reason": "<short reason>"} (and nothing else) ONLY when the call is NOT an order_creation attempt:
+- order_status / reservation / general calls place nothing new.
+- The agent only SUGGESTED items but the customer never engaged with ordering.
 
-A new order counts as placed ONLY when the customer explicitly confirmed it
-(words like "yes, place it", "confirm", "that's all, go ahead") AND the agent
-acknowledged it (read back items / total / order number, or said it is confirmed).
-Set "order_confirmed": true only then, else false.
+When the customer attempted to order (order_creation) ALWAYS return the order JSON below — even when details are missing or it was never confirmed (hangup, transfer, missing name/phone/items). Never use no_order for an order attempt. Put what you heard, empty strings for what you did not, and list the gaps in "missing_fields". Set "order_confirmed": true ONLY when the customer explicitly confirmed it (words like "yes, place it", "confirm", "that's all, go ahead") AND the agent acknowledged it (read back items / total / order number, or said it is confirmed); else false.
 
-Otherwise return ONLY valid JSON, no markdown, no explanation, with exactly these keys:
+Order JSON (ONLY valid JSON, no markdown, no explanation) with exactly these keys:
 {
+  "call_purpose": "order_creation",
   "order_confirmed": true,
   "order_number": "order ID / order number as spoken in the call (e.g. PB-ABC, PB441, ORD-123). Copy it EXACTLY as heard, else empty string — do NOT invent one",
   "customer_name": "full name as heard, else empty string — do NOT guess",
@@ -128,7 +183,8 @@ Otherwise return ONLY valid JSON, no markdown, no explanation, with exactly thes
   "total": total number or 0,
   "delivery_address": "if mentioned else empty string",
   "payment_method": "cash/UPI/card if mentioned else empty string",
-  "email": "if mentioned else empty string (optional — never block an order on it)"
+  "email": "if mentioned else empty string (optional — never block an order on it)",
+  "missing_fields": ["subset of: customer_name, customer_phone, items, order_number, confirmation, payment_method, delivery_address, order_type"]
 }
 Prices (all in dollars): if the call quotes a price, use it. If the price is missing, look it up in the MENU below and fill it in — a missing price must never block the order. Pizzas with no size heard default to Medium. Only items with no menu match stay 0. "total" must equal the sum of quantity × unit_price.
 MENU:
@@ -184,7 +240,12 @@ async def _find_shell(db, call_id: str, order_number: str | None):
 
 def _apply_extraction(order: Order, req: OrderCreateRequest, call: Call, shell_empty: bool) -> None:
     """Fill the shell from Gemini JSON. Empty shell fields are overwritten;
-    items are replaced only when the shell has none (payload data wins)."""
+    items are replaced only when the shell has none (payload data wins).
+
+    When the transcript attempt is missing fields, the order is flagged
+    `incomplete` (instead of looking confirmed) so staff can follow up and
+    the dashboard can filter it out of the fulfilment queue.
+    """
     if not order.customer_name and (req.customer_name or "").strip():
         order.customer_name = req.customer_name.strip()
     if not order.customer_phone and (req.customer_phone or "").strip():
@@ -211,9 +272,21 @@ def _apply_extraction(order: Order, req: OrderCreateRequest, call: Call, shell_e
                 quantity=it["quantity"], unit_price=Decimal(str(it["unit_price"])),
                 size=it["size"], notes=it["notes"],
             ))
+    missing = _compute_missing(req, "")
+    # keep caller-provided values in the event note; recompute without text
+    # is conservative (order_number may already be on the shell).
+    if order.order_number:
+        missing = [m for m in missing if m != "order_number"]
+    if missing:
+        order.status = INCOMPLETE_STATUS
+        note = f"Order extracted from transcript via Google LLM (incomplete: {', '.join(missing)})"
+    else:
+        if order.status == INCOMPLETE_STATUS:
+            order.status = "confirmed"
+        note = "Order extracted from transcript via Google LLM"
     order.source = "transcript_recovery"
-    order.events.append(OrderEvent(order_id=order.id, status="confirmed",
-                                   note="Order extracted from transcript via Google LLM"))
+    order.events.append(OrderEvent(order_id=order.id, status=order.status,
+                                   note=note))
 
 
 async def _get_google(db) -> GoogleSetting:
@@ -318,41 +391,122 @@ def _parse_json(text: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-async def extract_request_from_text(text: str, api_key: str, model: str):
-    """One-shot: transcript text → validated OrderCreateRequest or None.
-    Used synchronously by the webhook (straight path) and by the background
-    job (fallback path).
+async def analyze_transcript(text: str, api_key: str, model: str) -> dict:
+    """Transcript → {req, purpose, missing, no_order, reason}.
 
-    Completeness gates (an order is created ONLY for a real placement):
-    - no_order flag (status check / reservation / incomplete / transferred
-      call) → None
-    - no items → None
-    - not confirmed AND no order number heard → None (suggestions, price
-      questions, and hangups never become orders)
-    Customer name/phone completeness is checked by the caller, which can
-    also use call-level (ANI) values.
+    - purpose is ALWAYS classified (order_creation | order_status |
+      reservation | general) so the Call can be tagged for filtering even
+      when no order row is created.
+    - order_creation attempts ALWAYS yield a req (even partial) — the caller
+      saves it with status `incomplete` when fields are missing.
+    - order_status / reservation / general yield req=None (no order row).
     """
     from app.schemas import OrderCreateRequest as _OCR
     data = await _ask_gemini(text, api_key, model or "gemini-3.5-flash")
     if not data:
-        return None
+        return {"req": None, "purpose": "general", "missing": [],
+                "no_order": True, "reason": "no json"}
+    purpose = _normalize_purpose(data.get("call_purpose"), data, text)
     if data.get("no_order"):
         if data.get("reason"):
-            logger.info(f"order_recovery: no order ({data.get('reason')})")
-        return None
+            logger.info(f"order_recovery: no order ({data.get('reason')}) purpose={purpose}")
+        if purpose not in CALL_PURPOSES:
+            purpose = "general"
+        return {"req": None, "purpose": purpose, "missing": [],
+                "no_order": True, "reason": str(data.get("reason") or "")}
     try:
         req = _OCR.model_validate(data)
     except Exception as e:
         logger.warning(f"order_recovery: Gemini JSON failed validation: {e}")
-        return None
-    if not req.items:
-        return None
-    if not req.order_confirmed:
-        number = clean_str(req.order_number) or _extract_order_number_from_text(text or "")
-        if not number:
-            logger.info("order_recovery: order not confirmed and no order number heard, skipping")
-            return None
-    return req
+        return {"req": None, "purpose": purpose, "missing": [],
+                "no_order": True, "reason": "validation"}
+    if not req.call_purpose:
+        req.call_purpose = purpose
+    else:
+        purpose = _normalize_purpose(req.call_purpose, data, text)
+        req.call_purpose = purpose
+    if purpose in _NON_ORDER_PURPOSES:
+        logger.info(f"order_recovery: {purpose} call — tagging only, no order row")
+        return {"req": None, "purpose": purpose, "missing": [],
+                "no_order": True, "reason": purpose}
+    missing = _compute_missing(req, text)
+    req.missing_fields = missing
+    return {"req": req, "purpose": "order_creation", "missing": missing,
+            "no_order": False, "reason": ""}
+
+
+async def extract_request_from_text(text: str, api_key: str, model: str):
+    """Back-compat wrapper: returns the req only for order_creation attempts.
+
+    Status/reservation/general calls → None (no order row; use
+    analyze_transcript when you also need the purpose tag). Incomplete
+    order_creation attempts still return a req — the caller marks it
+    `incomplete` instead of dropping it.
+    """
+    result = await analyze_transcript(text, api_key, model)
+    return result["req"]
+
+
+async def _unique_generated_number(db) -> str:
+    for _ in range(10):
+        num = _gen_order_number()
+        exists = (await db.execute(
+            select(Order.id).where(Order.order_number == num))).scalar_one_or_none()
+        if exists is None:
+            return num
+    return f"PB-{''.join(secrets.choice(_ORDER_CODE_ALPHABET) for _ in range(6))}"
+
+
+async def build_order_from_req(db, req, missing: list[str], text: str,
+                               call: Call, customer_name: str,
+                               customer_phone: str, call_id: str):
+    """Persist an order_creation req (complete → confirmed, else incomplete).
+
+    Shared by the webhook straight path and the background recovery job so
+    both behave identically. Returns the Order (reusing on duplicate number).
+    """
+    from app.schemas import clean_str as _clean
+    items, total, _fee = _finalize_items(req, _clean(req.delivery_address))
+    number = (_clean(req.order_number) or "").strip().upper() \
+        or _extract_order_number_from_text(text or "")
+    missing = list(missing or [])
+    phone = (req.customer_phone or "").strip() or customer_phone or _extract_phone_from_text(text or "")
+    name = (req.customer_name or "").strip() or customer_name
+    if "customer_phone" in missing and phone:
+        missing = [m for m in missing if m != "customer_phone"]
+    if "customer_name" in missing and name:
+        missing = [m for m in missing if m != "customer_name"]
+    if not number:
+        number = await _unique_generated_number(db)
+        if "order_number" not in missing:
+            missing.append("order_number")
+    status = INCOMPLETE_STATUS if missing else "confirmed"
+    existing = (await db.execute(
+        select(Order).where(Order.order_number == number))).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    order = Order(
+        order_number=number, customer_name=name, customer_phone=phone,
+        email=_clean(req.email), order_type=req.order_type,
+        table_number=_clean(req.table_number), pickup_time=_clean(req.pickup_time),
+        delivery_address=_clean(req.delivery_address),
+        payment_method=_clean(req.payment_method),
+        status=status, total=Decimal(str(total)),
+        source="transcript_recovery", call_id=call_id,
+    )
+    db.add(order)
+    await db.flush()
+    for it in items:
+        db.add(OrderItem(
+            order_id=order.id, menu_item_id=None,
+            sku=it["sku"], name=it["name"], quantity=it["quantity"],
+            unit_price=Decimal(str(it["unit_price"])),
+            size=it["size"], notes=it["notes"]))
+    note = ("Order extracted from transcript via Google LLM"
+            if status == "confirmed"
+            else f"Order extracted from transcript via Google LLM (incomplete: {', '.join(missing)})")
+    db.add(OrderEvent(order_id=order.id, status=status, note=note))
+    return order
 
 
 async def get_google_key(db) -> tuple[str, str, bool]:
@@ -366,70 +520,36 @@ async def create_order_from_transcript(
     db, text: str, call: Call, customer_name: str, customer_phone: str, call_id: str,
     note: str = "Order extracted from transcript via Google LLM",
 ):
-    """Build a FULL order row straight from transcript text. Returns the
-    Order or None (no transcript / no key / no order found / bad JSON).
+    """Build an order row straight from transcript text.
 
-    The order_number comes from the transcript (LLM-extracted, regex fallback)
-    — it is NEVER generated here. Returns None when no order ID is heard.
+    - order_status / reservation / general → None (call is tagged, no row).
+    - order_creation with missing fields → row with status `incomplete`
+      (order_number generated when none was heard) so staff can follow up
+      and the dashboard can filter it separately.
+    - complete order_creation → status `confirmed` as before.
     """
     from app.schemas import clean_str as _clean
     api_key, model, enabled = await get_google_key(db)
     if not enabled or not api_key or not (text or "").strip():
         return None
-    req = await extract_request_from_text(text, api_key, model)
+    result = await analyze_transcript(text, api_key, model)
+    purpose = result["purpose"]
+    try:
+        if not (call.call_purpose or "").strip():
+            call.call_purpose = purpose
+    except Exception:
+        pass
+    req = result["req"]
     if req is None:
         return None
-
-    items, total, _fee = _finalize_items(req, _clean(req.delivery_address))
-
-    order_number = (_clean(req.order_number) or "").strip().upper()
-    if not order_number:
-        order_number = _extract_order_number_from_text(text)
-    if not order_number:
-        logger.warning("order_recovery: no order_number in transcript, skipping save")
-        return None
-
-    # Callers almost never speak their number — fall back to any phone-like
-    # digits in the transcript so the order/transaction keeps customer details.
-    phone = (req.customer_phone or "").strip() or customer_phone or _extract_phone_from_text(text)
-    # Email is optional; everything else is required. Never save an order
-    # with an unknown customer — status checks and fragments stay out.
-    name = (req.customer_name or "").strip() or customer_name
-    if not name or not phone:
+    if result["purpose"] == "order_creation" and (result["missing"] or []):
         logger.info(
-            "order_recovery: incomplete customer info "
-            f"(name={bool(name)}, phone={bool(phone)}), skipping save")
-        return None
+            "order_recovery: incomplete order "
+            f"({', '.join(result['missing'])}), saving as incomplete")
 
-    # Reuse the row if this transcript order ID was already saved (idempotent).
-    existing_order = (
-        await db.execute(select(Order).where(Order.order_number == order_number))
-    ).scalar_one_or_none()
-    if existing_order is not None:
-        logger.info(f"order_recovery: order {order_number!r} already exists, reusing")
-        return existing_order
-
-    order = Order(
-        order_number=order_number,
-        customer_name=name,
-        customer_phone=phone,
-        email=_clean(req.email), order_type=req.order_type,
-        table_number=_clean(req.table_number), pickup_time=_clean(req.pickup_time),
-        delivery_address=_clean(req.delivery_address),
-        payment_method=_clean(req.payment_method),
-        status="confirmed", total=Decimal(str(total)),
-        source="transcript_recovery", call_id=call_id,
-    )
-    db.add(order)
-    await db.flush()
-    for it in items:
-        db.add(OrderItem(
-            order_id=order.id, menu_item_id=None,
-            sku=it["sku"], name=it["name"],
-            quantity=it["quantity"], unit_price=Decimal(str(it["unit_price"])),
-            size=it["size"], notes=it["notes"],
-        ))
-    db.add(OrderEvent(order_id=order.id, status="confirmed", note=note))
+    order = await build_order_from_req(
+        db, req, list(result["missing"] or []), text,
+        call, customer_name, customer_phone, call_id)
     if order.order_number not in (call.order_numbers or []):
         call.order_numbers = [*(call.order_numbers or []), order.order_number]
     return order
@@ -490,8 +610,12 @@ async def _transcript_from_run(db, call: Call) -> str:
 
 async def recover_order_from_call(call_id: str, order_number: str | None = None) -> dict:
     """Background entry point: extract one call's order from its transcript.
-    Creates the order on success, saves nothing on failure — the UI only
-    ever shows real, extracted orders."""
+
+    - order_status / reservation / general → no order row; the Call is still
+      tagged with its purpose (committed) so it can be filtered.
+    - order_creation (complete or partial) → order row created/updated;
+      partial attempts get status `incomplete`.
+    """
     async with SessionLocal() as db:
         call = (await db.execute(
             select(Call).where(Call.call_id == call_id)
@@ -520,26 +644,26 @@ async def recover_order_from_call(call_id: str, order_number: str | None = None)
         if not text.strip():
             return {"status": "skipped", "reason": "no transcript"}
 
-        data = await _ask_gemini(text, api_key, g.model or "gemini-3.5-flash")
-        if not data or data.get("no_order"):
-            return {"status": "skipped", "reason": "no order in transcript"}
-
-        try:
-            req = OrderCreateRequest.model_validate(data)
-        except Exception as e:
-            logger.warning(f"order_recovery: Gemini JSON failed validation: {e}")
-            return {"status": "failed", "reason": "validation"}
-        if not req.items:
-            return {"status": "skipped", "reason": "no items extracted"}
+        result = await analyze_transcript(text, api_key, g.model or "gemini-3.5-flash")
+        purpose = result["purpose"]
+        if not (call.call_purpose or "").strip():
+            call.call_purpose = purpose
+        req = result["req"]
+        if req is None:
+            await db.commit()  # persist the purpose tag even with no order
+            reason = result.get("reason") or "no order in transcript"
+            return {"status": "skipped", "reason": reason,
+                    "call_purpose": purpose, "call_id": call_id}
 
         if order:
             _apply_extraction(order, req, call, shell_empty)
             if not (order.customer_phone or "").strip():
                 order.customer_phone = _extract_phone_from_text(text)
         else:
-            order = await create_order_from_transcript(
-                db, text, call, call.customer_name, call.customer_phone, call_id)
-            if order is None:  # pragma: no cover — defensive, already validated above
+            order = await build_order_from_req(
+                db, req, list(result["missing"] or []), text,
+                call, call.customer_name, call.customer_phone, call_id)
+            if order is None:  # pragma: no cover — defensive
                 return {"status": "failed", "reason": "create"}
         if order.order_number not in (call.order_numbers or []):
             call.order_numbers = [*(call.order_numbers or []), order.order_number]
@@ -560,4 +684,6 @@ async def recover_order_from_call(call_id: str, order_number: str | None = None)
 
         await db.commit()
         return {"status": "recovered", "order_number": order.order_number,
+                "order_status": order.status,
+                "call_purpose": call.call_purpose or purpose,
                 "call_id": call_id}
