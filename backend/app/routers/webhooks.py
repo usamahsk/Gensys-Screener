@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from loguru import logger
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -45,6 +45,47 @@ async def call_ended(
         await db.execute(select(Call).where(Call.call_id == call_id))
     ).scalar_one_or_none()
     if existing:
+        # Retry / late-arriving end-of-call: never lose a Dograh-side
+        # transfer. A mid-call /transfer creates a placeholder row first;
+        # the final call-ended (disposition=transfer) then fills in the
+        # transcript + summary. Retried call-ended webhooks also upgrade
+        # a completed row to transferred when the transfer info arrives.
+        updated_fields: list[str] = []
+        incoming_disposition = payload.resolved_disposition()
+        if incoming_disposition == "transferred" and existing.disposition != "transferred":
+            existing.disposition = "transferred"
+            updated_fields.append("disposition")
+        incoming_reason = (payload.transfer_reason or "").strip()
+        if incoming_reason and not (existing.escalation_reason or "").strip():
+            existing.escalation_reason = incoming_reason
+            updated_fields.append("escalation_reason")
+        if payload.transcript and not (existing.transcript or []):
+            existing.transcript = payload.transcript
+            updated_fields.append("transcript")
+        if payload.tool_calls and not (existing.tool_calls or []):
+            existing.tool_calls = payload.tool_calls
+            updated_fields.append("tool_calls")
+        if not (existing.summary or "").strip():
+            new_summary = await summarize(payload.transcript, payload.tool_calls, incoming_disposition)
+            if not new_summary and (payload.order_number or payload.transfer_reason):
+                new_summary = _synthesize_summary(payload)
+            if new_summary:
+                existing.summary = new_summary
+                updated_fields.append("summary")
+        if payload.order_number and payload.order_number not in (existing.order_numbers or []):
+            existing.order_numbers = [*(existing.order_numbers or []), payload.order_number]
+            updated_fields.append("order_numbers")
+        if not (existing.customer_phone or "").strip() and payload.resolved_customer_phone():
+            existing.customer_phone = payload.resolved_customer_phone()
+            updated_fields.append("customer_phone")
+        if not (existing.customer_name or "").strip() and payload.resolved_customer_name():
+            existing.customer_name = payload.resolved_customer_name()
+            updated_fields.append("customer_name")
+        if updated_fields:
+            existing.ended_at = existing.ended_at or datetime.now(timezone.utc)
+            await db.commit()
+            return {"status": "updated", "call_id": call_id,
+                    "updated": updated_fields, "disposition": existing.disposition}
         return {"status": "duplicate", "call_id": call_id}
 
     disposition = payload.resolved_disposition()
@@ -265,30 +306,88 @@ def _synthesize_summary(p: CallEndedWebhook) -> str:
 
 @router.post("/transfer", response_model=TransferContextResponse)
 async def transfer(payload: TransferWebhook, db: AsyncSession = Depends(get_db)) -> TransferContextResponse:
+    """Mid-call escalation handoff.
+
+    Dograh calls this when the voice agent transfers to a human; the call
+    later ends with a transfer status via /call-ended. Either order works:
+
+    - /transfer first (no Call row yet) → create a lightweight transferred
+      placeholder so the Agent View shows the handoff immediately; the later
+      /call-ended fills in transcript + summary (duplicate-upgrade path).
+    - /call-ended first → just flip that row to transferred here.
+
+    The response's agent_context is what the human agent reads to continue
+    the call without making the caller repeat themselves.
+    """
+    call_id = payload.resolved_call_id()
+    if not call_id:
+        raise HTTPException(400, "Missing call_id (or workflow_run_id)")
+    reason = payload.resolved_reason()
+    customer_name = payload.resolved_customer_name()
+    customer_phone = payload.resolved_customer_phone()
     call = (
-        await db.execute(select(Call).where(Call.call_id == payload.call_id))
+        await db.execute(select(Call).where(Call.call_id == call_id))
     ).scalar_one_or_none()
 
-    agent_context: dict[str, Any] = {"reason_for_transfer": payload.reason}
     if call:
         call.disposition = "transferred"
-        call.escalation_reason = payload.reason
-        agent_context["conversation"] = {
-            "ai_summary": call.summary,
-            "transcript_turns": len(call.transcript),
-            "orders_touched": call.order_numbers,
-        }
-        if payload.customer_name:
-            call.customer_name = call.customer_name or payload.customer_name
-        if payload.customer_phone:
-            call.customer_phone = call.customer_phone or payload.customer_phone
-    if payload.customer_phone:
-        agent_context["customer"] = {"phone": payload.customer_phone,
-                                     "name": payload.customer_name or ""}
+        if reason:
+            call.escalation_reason = reason
+        if customer_name and not (call.customer_name or "").strip():
+            call.customer_name = customer_name
+        if customer_phone and not (call.customer_phone or "").strip():
+            call.customer_phone = customer_phone
+        if not (call.summary or "").strip():
+            # No summary yet (transfer arrived before call end) — write a
+            # handoff line now so Agent View has something; call-ended
+            # replaces it with the full conversation summary later.
+            call.summary = (
+                f"Transferred to agent: {reason}. "
+                f"Customer {customer_name or customer_phone or 'unknown'} — "
+                "full conversation summary arrives when the call ends."
+                if reason else
+                "Transferred to a human agent. Full conversation summary arrives when the call ends."
+            )
+    else:
+        call = Call(
+            call_id=call_id,
+            disposition="transferred",
+            started_at=datetime.now(timezone.utc),
+            ended_at=None,
+            duration_seconds=0,
+            customer_name=customer_name,
+            customer_phone=customer_phone,
+            transcript=[],
+            tool_calls=[],
+            order_numbers=[],
+            summary=(
+                f"Transferred to agent: {reason}. "
+                f"Customer {customer_name or customer_phone or 'unknown'} — "
+                "full conversation summary arrives when the call ends."
+                if reason else
+                "Transferred to a human agent. Full conversation summary arrives when the call ends."
+            ),
+            escalation_reason=reason,
+        )
+        db.add(call)
+        await db.flush()
+
+    agent_context: dict[str, Any] = {"reason_for_transfer": reason}
+    transcript = call.transcript or []
+    agent_context["conversation"] = {
+        "ai_summary": call.summary or "",
+        "transcript_turns": len(transcript),
+        # Last turns so the agent can continue mid-conversation.
+        "transcript_tail": transcript[-10:] if transcript else [],
+        "orders_touched": call.order_numbers or [],
+    }
+    if customer_phone:
+        agent_context["customer"] = {"phone": customer_phone,
+                                     "name": customer_name or call.customer_name or ""}
         last_order = (
             await db.execute(
                 select(Order)
-                .where(Order.customer_phone == payload.customer_phone)
+                .where(Order.customer_phone == customer_phone)
                 .order_by(Order.created_at.desc()).limit(1)
             )
         ).scalar_one_or_none()
@@ -300,5 +399,6 @@ async def transfer(payload: TransferWebhook, db: AsyncSession = Depends(get_db))
             }
 
     await db.commit()
-    return TransferContextResponse(call_id=payload.call_id, recorded=call is not None,
+    logger.info(f"POST /api/webhooks/transfer | call_id={call_id!r} reason={reason!r}")
+    return TransferContextResponse(call_id=call_id, recorded=True,
                                    agent_context=agent_context)

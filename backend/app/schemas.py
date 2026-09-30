@@ -673,11 +673,17 @@ class CallEndedWebhook(BaseModel):
     def resolved_disposition(self) -> str:
         if self.transfer_requested or self.transfer_reason:
             return "transferred"
+        d = (self.disposition or "").strip().lower()
+        # Dograh-side transfer ends the call with a transfer status — accept
+        # every spelling ("Transfer", "transfer", "transferring", "transferred",
+        # "warm transfer", "escalated", "escalation", "handoff to agent"...).
+        if any(k in d for k in ("transfer", "xfer", "escalat", "handoff", "agent")):
+            return "transferred"
         if not self.call_completed_successfully:
             return "failed"
         if "abandon" in (self.call_outcome or "").lower():
             return "abandoned"
-        return self.disposition if self.disposition in (
+        return d if d in (
             "completed", "transferred", "failed", "abandoned"
         ) else "completed"
 
@@ -686,10 +692,96 @@ class CallEndedWebhook(BaseModel):
 
 
 class TransferWebhook(BaseModel):
-    call_id: str
-    reason: str
+    """Mid-call escalation handoff (Dograh -> app).
+
+    Tolerates Dograh template spellings: every field has a default, stray
+    spaces in keys are stripped, {{...}} unresolved literals become "",
+    and reason accepts transfer_reason / transfer_requested_reason /
+    reason_for_transfer / escalation_reason aliases. call_id accepts
+    workflow_run_id alias.
+    """
+
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
+    call_id: str = ""
+    workflow_run_id: str = ""
+    reason: str = ""
+    transfer_reason: str = ""
+    transfer_requested_reason: str = ""
+    reason_for_transfer: str = ""
+    escalation_reason: str = ""
     customer_name: Optional[str] = ""
     customer_phone: Optional[str] = ""
+    phone: Optional[str] = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_aliases(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        stripped: dict[str, Any] = {}
+        for k, v in data.items():
+            sk = str(k).strip()
+            if sk not in stripped:
+                stripped[sk] = v
+        data = stripped
+        aliases = {
+            "workflow run id": "call_id",
+            "workflow_run_id": "call_id",
+            "transfer reason": "reason",
+            "transfer_reason": "reason",
+            "transfer requested reason": "reason",
+            "transfer_requested_reason": "reason",
+            "reason for transfer": "reason",
+            "reason_for_transfer": "reason",
+            "escalation reason": "reason",
+            "escalation_reason": "reason",
+            "call outcome": "reason",
+            "phone": "customer_phone",
+            "phone number": "customer_phone",
+            "customer phone number": "customer_phone",
+            "customer name": "customer_name",
+            "name": "customer_name",
+            "first name": "customer_name",
+        }
+        normalized = {str(k).strip().lower().replace("-", " "): v for k, v in data.items()}
+        for alias, canonical in aliases.items():
+            if alias in normalized and not data.get(canonical):
+                data[canonical] = normalized[alias]
+        return data
+
+    @field_validator("call_id", "workflow_run_id", "reason",
+                     "transfer_reason", "transfer_requested_reason",
+                     "reason_for_transfer", "escalation_reason",
+                     "customer_name", "customer_phone", "phone", mode="before")
+    @classmethod
+    def _coerce_strs(cls, v: Any) -> Any:
+        if v is None:
+            return ""
+        if is_unresolved_template(v):
+            return ""
+        s = str(v).strip()
+        if s.startswith("<") and s.endswith(">"):
+            return ""
+        return s
+
+    def resolved_call_id(self) -> str:
+        return (self.call_id or self.workflow_run_id or "").strip()
+
+    def resolved_reason(self) -> str:
+        for cand in (self.reason, self.transfer_reason,
+                     self.transfer_requested_reason, self.reason_for_transfer,
+                     self.escalation_reason):
+            s = clean_str(cand)
+            if s:
+                return s
+        return ""
+
+    def resolved_customer_phone(self) -> str:
+        return clean_str(self.customer_phone or self.phone)
+
+    def resolved_customer_name(self) -> str:
+        return clean_str(self.customer_name)
 
 
 class TransferContextResponse(BaseModel):

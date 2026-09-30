@@ -95,5 +95,5 @@ async def call_detail(call_id: str, db: AsyncSession = Depends(get_db)):
         "workflow_id": c.workflow_id,
         "run_id": c.run_id,
         "workflow_name": c.workflow_name,
-        "call_type": c.call_type,
+        "transcript_turns": len(c.transcript or []),
     }

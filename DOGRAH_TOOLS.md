@@ -238,6 +238,17 @@ number so numbering stays sequential (total count + 1).
 Response includes `agent_context` — the summary + customer + last order that the
 human agent sees on the dashboard's Agent View.
 
+> **Transfer from the Dograh side:** when the voice agent transfers, the call
+> ends with a transfer status — send `POST <BASE>/api/webhooks/call-ended`
+> with `"disposition": "transfer"` (any of transfer / transferred /
+> escalated / handoff-to-agent) plus `transfer_reason` and the transcript.
+> That call appears in the dashboard's **Agent View** (`?disposition=transferred`)
+> with the transfer reason, the AI conversation summary, and the transcript
+> tail so the human agent can continue the call without asking the caller to
+> repeat themselves. Calling `/transfer` mid-call is optional but recommended:
+> it pins the handoff in Agent View immediately, and the later `call-ended`
+> fills in the full summary.
+
 ---
 
 ## Agent system prompt additions (Pizza Bay)

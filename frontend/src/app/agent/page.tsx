@@ -1,20 +1,29 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { apiClient, fmtDateTime, fmtDuration, fmtMoney, type CallRow, type OrderRow } from "@/lib/api";
+import { apiClient, fmtDateTime, fmtDuration, fmtMoney, type CallDetail, type CallRow, type OrderRow } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { DispositionBadge } from "@/app/page";
 import { PageHeader } from "@/components/page-header";
-import { FileText, Headset, ShoppingCart, User } from "lucide-react";
+import { ChatTranscript } from "@/components/chat-transcript";
+import { FileText, Headset, RefreshCw, ShoppingCart, User, Volume2 } from "lucide-react";
 
 /**
- * Agent View — what a human agent sees when a call is escalated:
- * escalation reason, AI summary, customer context, and related orders.
+ * Agent View — what a human agent sees when a call is transferred from Dograh:
+ * transfer reason, AI conversation summary, and the transcript tail so the
+ * agent can continue the call without making the caller repeat themselves.
+ *
+ * Data source: every call that ends with a transfer status
+ * (POST /api/webhooks/call-ended with disposition=transfer*, or
+ * POST /api/webhooks/transfer) lands here with disposition=transferred.
  */
 export default function AgentViewPage() {
   const [transferred, setTransferred] = useState<CallRow[]>([]);
   const [selected, setSelected] = useState<CallRow | null>(null);
+  const [detail, setDetail] = useState<CallDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
   const [orders, setOrders] = useState<OrderRow[]>([]);
   const [error, setError] = useState("");
 
@@ -35,22 +44,44 @@ export default function AgentViewPage() {
     return () => clearInterval(t);
   }, [load]);
 
+  // Full conversation for the selected transfer: transcript + tool calls +
+  // summary to continue the call.
   useEffect(() => {
-    if (selected?.customer_phone) {
+    if (!selected) {
+      setDetail(null);
+      setOrders([]);
+      return;
+    }
+    setDetailLoading(true);
+    apiClient.callDetail(selected.call_id)
+      .then((d) => setDetail(d))
+      .catch(() => setDetail(null))
+      .finally(() => setDetailLoading(false));
+    if (selected.customer_phone) {
       apiClient.orders({ search: selected.customer_phone }).then(setOrders).catch(() => setOrders([]));
-    } else if (selected) {
-      apiClient.orders({ search: selected.order_numbers[0] || "" }).then(setOrders).catch(() => setOrders([]));
+    } else if (selected.order_numbers[0]) {
+      apiClient.orders({ search: selected.order_numbers[0] }).then(setOrders).catch(() => setOrders([]));
     } else {
       setOrders([]);
     }
   }, [selected]);
+
+  const summary = detail?.summary || selected?.summary || "";
+  const escalationReason = detail?.escalation_reason || selected?.escalation_reason || "";
+  const transcript = detail?.transcript || [];
+  const toolCalls = detail?.tool_calls || [];
 
   return (
     <div className="space-y-4">
       <PageHeader
         icon={Headset}
         title="Agent View — Escalated Calls"
-        description="Context handed over by the AI when it transfers a call. The agent sees this before picking up — the caller never has to repeat themselves."
+        description="Transferred calls land here with the handoff summary + conversation so far. Read the summary, then continue the call — the caller never repeats themselves."
+        actions={
+          <Button variant="outline" size="sm" onClick={load}>
+            <RefreshCw className="mr-2 h-4 w-4" /> Refresh
+          </Button>
+        }
       />
 
       {error && <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>}
@@ -65,11 +96,14 @@ export default function AgentViewPage() {
                 selected?.call_id === c.call_id ? "border-primary bg-accent" : "hover:bg-muted/50"
               }`}
             >
-              <div className="flex items-center justify-between text-sm font-medium">
-                {c.customer_name || c.customer_phone || "Unknown"}
-                <span className="text-xs text-muted-foreground">{fmtDateTime(c.started_at)}</span>
+              <div className="flex items-center justify-between gap-2 text-sm font-medium">
+                <span className="truncate">{c.customer_name || c.customer_phone || "Unknown"}</span>
+                <DispositionBadge disposition={c.disposition} />
               </div>
-              <div className="mt-1 truncate text-xs text-muted-foreground">{c.escalation_reason || c.summary}</div>
+              <div className="mt-1 flex items-center justify-between gap-2">
+                <div className="truncate text-xs text-muted-foreground">{c.escalation_reason || c.summary || "Transferred"}</div>
+                <span className="shrink-0 text-xs text-muted-foreground">{fmtDateTime(c.started_at)}</span>
+              </div>
             </button>
           ))}
           {transferred.length === 0 && !error && (
@@ -85,12 +119,12 @@ export default function AgentViewPage() {
               <CardHeader className="pb-2">
                 <CardTitle className="flex items-center gap-2 text-sm text-amber-800">
                   <Badge variant="secondary" className="bg-amber-200 text-amber-900 hover:bg-amber-200">
-                    Escalation reason
+                    Transfer — reason to continue from
                   </Badge>
                 </CardTitle>
               </CardHeader>
               <CardContent className="text-sm text-amber-900">
-                {selected.escalation_reason || "Not specified"}
+                {escalationReason || "Transferred from the voice agent — see summary below."}
               </CardContent>
             </Card>
 
@@ -100,10 +134,47 @@ export default function AgentViewPage() {
                   <span className="flex h-7 w-7 items-center justify-center rounded-lg bg-[#EAF1FF]">
                     <FileText className="h-4 w-4 text-[#0068FF]" />
                   </span>
-                  AI Summary
+                  Conversation summary — continue the call from here
                 </CardTitle>
               </CardHeader>
-              <CardContent className="text-sm">{selected.summary}</CardContent>
+              <CardContent className="text-sm">{summary || "Summary arrives when the call ends."}</CardContent>
+            </Card>
+
+            <Card className="card-clean">
+              <CardHeader className="pb-2">
+                <CardTitle className="flex items-center gap-2 text-sm text-[#000E49]">
+                  Conversation so far
+                  {transcript.length > 0 && (
+                    <Badge variant="outline" className="ml-1">{transcript.length} turns</Badge>
+                  )}
+                </CardTitle>
+              </CardHeader>
+              <CardContent>
+                {detailLoading ? (
+                  <div className="text-sm text-muted-foreground">Loading conversation…</div>
+                ) : (
+                  <ChatTranscript turns={transcript} />
+                )}
+                {toolCalls.length > 0 && (
+                  <div className="mt-3 space-y-1">
+                    <div className="text-xs font-semibold text-muted-foreground">What the voice agent already did</div>
+                    {toolCalls.map((t, i) => (
+                      <div key={i} className="flex items-center gap-2 rounded-lg bg-muted/60 px-3 py-1.5 font-mono text-xs">
+                        <Badge variant="outline">{t.name}</Badge>
+                        <span className="truncate text-muted-foreground">{t.args_summary}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {(detail?.recording_url || selected.recording_url) && (
+                  <div className="mt-3 rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3">
+                    <div className="mb-1 flex items-center gap-1 text-xs font-semibold text-muted-foreground">
+                      <Volume2 className="h-3.5 w-3.5" /> Call recording
+                    </div>
+                    <audio controls className="w-full" src={detail?.recording_url || selected.recording_url} />
+                  </div>
+                )}
+              </CardContent>
             </Card>
 
             <div className="grid gap-4 md:grid-cols-2">
@@ -117,7 +188,7 @@ export default function AgentViewPage() {
                   </CardTitle>
                 </CardHeader>
                 <CardContent className="space-y-1 text-sm">
-                  <div className="font-medium">{selected.customer_name || "Unknown"}</div>
+                  <div className="font-medium">{selected.customer_name || detail?.customer_name || "Unknown"}</div>
                   <div className="text-muted-foreground">{selected.customer_phone || "—"}</div>
                   <div className="text-xs text-muted-foreground">
                     Call duration {fmtDuration(selected.duration_seconds)} · {fmtDateTime(selected.started_at)}
