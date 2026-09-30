@@ -126,6 +126,11 @@ class OrderCreateRequest(BaseModel):
     items: list[OrderItemIn] = Field(default_factory=list)
     total: Optional[float] = None
     call_id: Optional[str] = ""
+    # --- Transcript-extraction flags (Gemini only; ignored on tool calls) ---
+    # order_confirmed: customer explicitly confirmed placement AND the agent
+    # acknowledged it. no_order: status check / reservation / incomplete call.
+    order_confirmed: bool = False
+    no_order: bool = False
     # --- Voice-platform provider + telephony id (Dograh flavour of Genesys id) ---
     provider: Optional[str] = ""
     provider_call_id: Optional[str] = ""
@@ -241,6 +246,11 @@ class OrderCreateRequest(BaseModel):
             return float(str(v))
         except (ValueError, TypeError):
             return None
+
+    @field_validator("order_confirmed", "no_order", mode="before")
+    @classmethod
+    def _coerce_flags(cls, v: Any) -> Any:
+        return coerce_bool(v) if not isinstance(v, bool) else v
 
     @field_validator("customer_name", "customer_phone", "email", "table_number",
                      "pickup_time", "delivery_address", "payment_method",

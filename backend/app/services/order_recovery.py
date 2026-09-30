@@ -103,24 +103,37 @@ DRINKS: Soft Drink can (Coke/Sprite) 1.99, Soft Drink 1.5 litre bottle 3.49, Bot
 DESSERTS: Chocolate Brownie 4.49, Choco Lava Cake 4.99"""
 
 _PROMPT = """You extract a restaurant order from a phone-call transcript.
-Return ONLY valid JSON, no markdown, no explanation, with exactly these keys:
+First decide whether a NEW order was actually placed on this call.
+
+Return {"no_order": true, "reason": "<short reason>"} (and nothing else) when ANY of these is true:
+- Status / inquiry only: the customer asks about an existing order (where is it, is it ready, cancel or change it) and places nothing new.
+- Reservation / table booking (party size, dates, holding a table) — that is not a food order.
+- Transferred, hung up, or otherwise incomplete: the order was never confirmed (see below).
+- Menu questions, prices, hours, complaints — with no new order confirmed.
+- The agent only SUGGESTED items but the customer never said yes.
+
+A new order counts as placed ONLY when the customer explicitly confirmed it
+(words like "yes, place it", "confirm", "that's all, go ahead") AND the agent
+acknowledged it (read back items / total / order number, or said it is confirmed).
+Set "order_confirmed": true only then, else false.
+
+Otherwise return ONLY valid JSON, no markdown, no explanation, with exactly these keys:
 {
-  "order_number": "order ID / order number as spoken in the call (e.g. PB-ABC, ORD-123). Copy it EXACTLY as heard, else empty string — do NOT invent one",
-  "customer_name": "full name or empty string",
+  "order_confirmed": true,
+  "order_number": "order ID / order number as spoken in the call (e.g. PB-ABC, PB441, ORD-123). Copy it EXACTLY as heard, else empty string — do NOT invent one",
+  "customer_name": "full name as heard, else empty string — do NOT guess",
   "customer_phone": "digits only, include + and country code if heard, else empty string",
   "order_type": "takeaway or dinein ONLY - delivery, pickup, takeaway and takeout all mean takeaway; use dinein only for eat-in/table service",
   "items": [{"name": "dish as heard", "quantity": number, "unit_price": number, "size": "Small/Medium/Large/Regular/Thin if mentioned else empty"}],
   "total": total number or 0,
   "delivery_address": "if mentioned else empty string",
   "payment_method": "cash/UPI/card if mentioned else empty string",
-  "email": "if mentioned else empty string"
+  "email": "if mentioned else empty string (optional — never block an order on it)"
 }
-Prices (all in dollars): if the call quotes a price, use it. Otherwise use the MENU below,
-matching item and size. Pizzas with no size heard default to Medium. Unknown items stay 0.
+Prices (all in dollars): if the call quotes a price, use it. If the price is missing, look it up in the MENU below and fill it in — a missing price must never block the order. Pizzas with no size heard default to Medium. Only items with no menu match stay 0. "total" must equal the sum of quantity × unit_price.
 MENU:
 """ + MENU + """
 Rules: quantities default to 1. Do NOT add any delivery fee yourself — it is computed afterwards.
-If no order was placed in the call, return {"no_order": true}.
 
 Transcript:
 {transcript}
@@ -308,10 +321,24 @@ def _parse_json(text: str) -> dict | None:
 async def extract_request_from_text(text: str, api_key: str, model: str):
     """One-shot: transcript text → validated OrderCreateRequest or None.
     Used synchronously by the webhook (straight path) and by the background
-    job (fallback path)."""
+    job (fallback path).
+
+    Completeness gates (an order is created ONLY for a real placement):
+    - no_order flag (status check / reservation / incomplete / transferred
+      call) → None
+    - no items → None
+    - not confirmed AND no order number heard → None (suggestions, price
+      questions, and hangups never become orders)
+    Customer name/phone completeness is checked by the caller, which can
+    also use call-level (ANI) values.
+    """
     from app.schemas import OrderCreateRequest as _OCR
     data = await _ask_gemini(text, api_key, model or "gemini-3.5-flash")
-    if not data or data.get("no_order"):
+    if not data:
+        return None
+    if data.get("no_order"):
+        if data.get("reason"):
+            logger.info(f"order_recovery: no order ({data.get('reason')})")
         return None
     try:
         req = _OCR.model_validate(data)
@@ -320,6 +347,11 @@ async def extract_request_from_text(text: str, api_key: str, model: str):
         return None
     if not req.items:
         return None
+    if not req.order_confirmed:
+        number = clean_str(req.order_number) or _extract_order_number_from_text(text or "")
+        if not number:
+            logger.info("order_recovery: order not confirmed and no order number heard, skipping")
+            return None
     return req
 
 
@@ -360,6 +392,14 @@ async def create_order_from_transcript(
     # Callers almost never speak their number — fall back to any phone-like
     # digits in the transcript so the order/transaction keeps customer details.
     phone = (req.customer_phone or "").strip() or customer_phone or _extract_phone_from_text(text)
+    # Email is optional; everything else is required. Never save an order
+    # with an unknown customer — status checks and fragments stay out.
+    name = (req.customer_name or "").strip() or customer_name
+    if not name or not phone:
+        logger.info(
+            "order_recovery: incomplete customer info "
+            f"(name={bool(name)}, phone={bool(phone)}), skipping save")
+        return None
 
     # Reuse the row if this transcript order ID was already saved (idempotent).
     existing_order = (
@@ -371,7 +411,7 @@ async def create_order_from_transcript(
 
     order = Order(
         order_number=order_number,
-        customer_name=(req.customer_name or "").strip() or customer_name,
+        customer_name=name,
         customer_phone=phone,
         email=_clean(req.email), order_type=req.order_type,
         table_number=_clean(req.table_number), pickup_time=_clean(req.pickup_time),
