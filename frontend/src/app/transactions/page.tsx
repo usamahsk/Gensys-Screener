@@ -191,7 +191,12 @@ export default function TransactionsPage() {
     setBackfilling(true);
     try {
       const r = await apiClient.backfillProviderIds();
-      toast.success(`Provider IDs filled on ${r.updated_calls} calls and ${r.updated_orders} orders`);
+      const bits = [
+        `${r.updated_calls} calls`,
+        `${r.updated_orders} orders`,
+      ];
+      if (r.updated_customers) bits.push(`${r.updated_customers} customer details`);
+      toast.success(`Backfilled ${bits.join(", ")}`);
       load();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Backfill failed");
@@ -350,9 +355,9 @@ export default function TransactionsPage() {
         description="Every call and order in one place — transaction record, linked orders, run evidence and the provider chain."
         actions={
           <div className="flex items-center gap-2">
-            <Button variant="outline" size="sm" onClick={backfill} disabled={backfilling} title="Fill empty Provider IDs on old rows from run details">
+            <Button variant="outline" size="sm" onClick={backfill} disabled={backfilling} title="Fill empty Provider IDs and missing customer details on old rows from run details">
               <Database className={`mr-2 h-4 w-4 ${backfilling ? "animate-pulse" : ""}`} />
-              {backfilling ? "Backfilling…" : "Backfill provider IDs"}
+              {backfilling ? "Backfilling…" : "Backfill missing data"}
             </Button>
             <Button variant="outline" size="sm" onClick={load} disabled={loading}>
               <RefreshCw className={`mr-2 h-4 w-4 ${loading ? "animate-spin" : ""}`} /> Refresh

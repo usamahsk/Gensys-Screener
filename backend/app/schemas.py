@@ -411,6 +411,12 @@ class CallEndedWebhook(BaseModel):
     customer_phone: str = ""
     phone: str = ""
     email: str = ""
+    # Nested Dograh contexts — the ANI phone (caller_number / from_number)
+    # and often the name live here when the post-call template doesn't map
+    # them to the top-level customer_* fields. Accept dicts or JSON strings.
+    gathered_context: dict[str, Any] = {}
+    initial_context: dict[str, Any] = {}
+    customer: dict[str, Any] = {}
 
     # cost / recording
     duration: int = 0
@@ -578,7 +584,8 @@ class CallEndedWebhook(BaseModel):
             return ""
         return s
 
-    @field_validator("cost_info", mode="before")
+    @field_validator("cost_info", "gathered_context", "initial_context",
+                      "customer", mode="before")
     @classmethod
     def _coerce_cost_info(cls, v: Any) -> Any:
         if isinstance(v, dict):
@@ -657,11 +664,56 @@ class CallEndedWebhook(BaseModel):
                 return s[:128]
         return ""
 
+    def _nested_customer(self, *keys: str) -> str:
+        """First non-empty value for any key across the nested Dograh scopes.
+
+        The ANI phone arrives as caller_number / from_number / msisdn inside
+        initial_context; the name often sits in gathered_context. Top-level
+        fields always win — this is only the fallback.
+        """
+        scopes = [self.customer or {}, self.gathered_context or {},
+                  self.initial_context or {}]
+        for scope in scopes:
+            if not isinstance(scope, dict):
+                continue
+            lowered = {str(k).strip().lower(): v for k, v in scope.items()}
+            for key in keys:
+                v = scope.get(key, lowered.get(key.lower()))
+                s = clean_str(v)
+                if s:
+                    return s
+        return ""
+
     def resolved_customer_name(self) -> str:
-        return self.customer_name or self.first_name
+        return (
+            clean_str(self.customer_name)
+            or clean_str(self.first_name)
+            or self._nested_customer(
+                "customer_name", "name", "full_name", "fullname",
+                "first_name", "firstname", "caller_name", "callerName")
+        )
 
     def resolved_customer_phone(self) -> str:
-        return self.customer_phone or self.phone
+        return (
+            clean_str(self.customer_phone)
+            or clean_str(self.phone)
+            or self._nested_customer(
+                "customer_phone", "phone", "phone_number", "phoneNumber",
+                "caller_number", "callerNumber", "from_number", "from",
+                "msisdn", "ani", "caller_id", "callerId")
+        )
+
+    def resolved_first_name(self) -> str:
+        return (
+            clean_str(self.first_name)
+            or self._nested_customer("first_name", "firstname", "name")
+        ).split(" ")[0]
+
+    def resolved_email(self) -> str:
+        return (
+            clean_str(self.email)
+            or self._nested_customer("email", "customer_email", "customerEmail")
+        )
 
     def resolved_duration(self) -> int:
         if self.duration_seconds:

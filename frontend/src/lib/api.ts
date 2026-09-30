@@ -303,7 +303,7 @@ export const apiClient = {
     return api<{ transactions: TransactionRow[]; total: number }>(`/api/transactions${suffix}`);
   },
   backfillProviderIds: () =>
-    api<{ updated_calls: number; updated_orders: number; runs_scanned: number }>(
+    api<{ updated_calls: number; updated_orders: number; updated_customers: number; runs_scanned: number }>(
       "/api/transactions/backfill-provider-ids",
       { method: "POST" }
     ),

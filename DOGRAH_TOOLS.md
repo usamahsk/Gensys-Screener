@@ -219,6 +219,17 @@ number so numbering stays sequential (total count + 1).
 ```
 `disposition`: completed | transferred | failed | abandoned.
 
+> **Empty customer on transactions?** The app reads `customer_name` /
+> `customer_phone` (or `phone`) top-level first, then falls back to nested
+> `gathered_context` / `initial_context` / `customer` objects (`customer_name`,
+> `phone_number`, `caller_number`, `from_number`, `msisdn`, ...). If your
+> template sends none of these, the call still saves (transcript → order
+> extraction) but the customer stays blank. Easiest fix: pass the whole
+> contexts through, e.g. `"gathered_context": "{{gathered_context}}"` and
+> `"initial_context": "{{initial_context}}"`. For old rows, hit
+> **Backfill missing data** on the Transactions page — it pulls the ANI
+> phone/name out of the voice-platform run.
+
 > **When does call-ended fire?** Only when the Dograh workflow has this URL
 > configured as its post-call webhook — it then fires after EVERY call end,
 > including caller hangups ("call cut"). If no call row appears at all, the

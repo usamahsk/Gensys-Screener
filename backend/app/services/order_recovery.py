@@ -63,6 +63,25 @@ def _extract_order_number_from_text(text: str) -> str:
             return cand
     return ""
 
+def _extract_phone_from_text(text: str) -> str:
+    """Last-resort phone: callers rarely speak their number, but when they do
+    (or the transcript carries ANI/CLI headers), grab it so the order and its
+    transaction still carry customer details."""
+    if not text:
+        return ""
+    cands: list[str] = []
+    for m in re.finditer(r"\+?\d[\d\s\-().]{7,}\d", text):
+        digits = re.sub(r"\D", "", m.group(0))
+        if 10 <= len(digits) <= 15:
+            cands.append(("+" + digits) if m.group(0).strip().startswith("+") else digits)
+    if not cands:
+        return ""
+    for c in cands:  # prefer international format
+        if c.startswith("+"):
+            return c
+    return sorted(cands, key=len, reverse=True)[0]
+
+
 MENU = """PIZZAS (Small / Medium / Large) — crust Regular or Thin at no extra charge:
 - Margherita Pizza (Veg): 8.99 / 11.99 / 14.99
 - Pepperoni Pizza (Non-Veg): 9.99 / 12.99 / 15.99
@@ -329,6 +348,10 @@ async def create_order_from_transcript(
         logger.warning("order_recovery: no order_number in transcript, skipping save")
         return None
 
+    # Callers almost never speak their number — fall back to any phone-like
+    # digits in the transcript so the order/transaction keeps customer details.
+    phone = (req.customer_phone or "").strip() or customer_phone or _extract_phone_from_text(text)
+
     # Reuse the row if this transcript order ID was already saved (idempotent).
     existing_order = (
         await db.execute(select(Order).where(Order.order_number == order_number))
@@ -340,7 +363,7 @@ async def create_order_from_transcript(
     order = Order(
         order_number=order_number,
         customer_name=(req.customer_name or "").strip() or customer_name,
-        customer_phone=(req.customer_phone or "").strip() or customer_phone,
+        customer_phone=phone,
         email=_clean(req.email), order_type=req.order_type,
         table_number=_clean(req.table_number), pickup_time=_clean(req.pickup_time),
         delivery_address=_clean(req.delivery_address),
@@ -462,6 +485,8 @@ async def recover_order_from_call(call_id: str, order_number: str | None = None)
 
         if order:
             _apply_extraction(order, req, call, shell_empty)
+            if not (order.customer_phone or "").strip():
+                order.customer_phone = _extract_phone_from_text(text)
         else:
             order = await create_order_from_transcript(
                 db, text, call, call.customer_name, call.customer_phone, call_id)

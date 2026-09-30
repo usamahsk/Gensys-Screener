@@ -156,6 +156,32 @@ async def list_sessions(
     return {"transactions": transactions, "total": len(transactions)}
 
 
+# Customer keys inside a Dograh run's gathered/initial context (mirrors the
+# nested fallback in CallEndedWebhook). The ANI phone arrives as
+# caller_number / from_number in initial_context.
+_CTX_PHONE_KEYS = (
+    "customer_phone", "phone", "phone_number", "phoneNumber",
+    "caller_number", "callerNumber", "from_number", "from",
+    "msisdn", "ani", "caller_id", "callerId",
+)
+_CTX_NAME_KEYS = (
+    "customer_name", "name", "full_name", "fullname",
+    "first_name", "firstname", "caller_name", "callerName",
+)
+
+
+def _first_ctx_value(scopes: list[dict], keys: tuple[str, ...]) -> str:
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        lowered = {str(k).strip().lower(): v for k, v in scope.items()}
+        for key in keys:
+            v = scope.get(key, lowered.get(key.lower()))
+            if isinstance(v, str) and v.strip() and "{{" not in v:
+                return v.strip()
+    return ""
+
+
 @router.post("/backfill-provider-ids", response_model=dict)
 async def backfill_provider_ids(db: AsyncSession = Depends(get_db)):
     """Permanently fill empty provider IDs on existing rows.
@@ -169,6 +195,9 @@ async def backfill_provider_ids(db: AsyncSession = Depends(get_db)):
       link run_id/workflow_id, then run detail → context ids
     - call_id that already looks like a session UUID → store it
     Linked orders inherit the id from their call.
+    Also fills customer name/phone that the post-call webhook never carried
+    (Dograh keeps the ANI phone in the run's initial/gathered context) —
+    this repairs old transactions that show an empty customer.
     """
     import json as _json
 
@@ -195,11 +224,14 @@ async def backfill_provider_ids(db: AsyncSession = Depends(get_db)):
                 orders_by_number[o.order_number] = o
 
     updated_calls = 0
+    updated_customers = 0
     runs_scanned = 0
     for c in all_calls:
-        if c.provider_call_id:
+        need_customer = not (c.customer_phone or "").strip() or not (c.customer_name or "").strip()
+        if c.provider_call_id and not need_customer:
             continue
         pid, prov = "", ""
+        ctx_scopes: list[dict] = []
         if c.genesys_conversation_id:
             pid, prov = c.genesys_conversation_id, "genesys"
         elif c.run_id and c.workflow_id and api_key:
@@ -208,6 +240,8 @@ async def backfill_provider_ids(db: AsyncSession = Depends(get_db)):
                     api_key, base_url, c.workflow_id, c.run_id)
                 tele = _extract_telephony(detail)
                 pid, prov = tele["provider_call_id"], tele["provider"]
+                ctx_scopes = [detail.get("gathered_context") or {},
+                              detail.get("initial_context") or {}]
             except Exception:
                 pid, prov = "", ""
             runs_scanned += 1
@@ -227,10 +261,14 @@ async def backfill_provider_ids(db: AsyncSession = Depends(get_db)):
                 if match and match.get("workflow_id"):
                     wf = match["workflow_id"]
                     tele = _extract_telephony(match)
+                    ctx_scopes = [match.get("gathered_context") or {},
+                                  match.get("initial_context") or {}]
                     if not tele["provider_call_id"]:
                         detail = await dograh_client.get_run_detail(
                             api_key, base_url, wf, run_id_int)
                         tele = _extract_telephony(detail)
+                        ctx_scopes = [detail.get("gathered_context") or {},
+                                      detail.get("initial_context") or {}]
                     pid, prov = tele["provider_call_id"], tele["provider"]
                     if pid:
                         c.run_id, c.workflow_id = run_id_int, wf
@@ -246,28 +284,44 @@ async def backfill_provider_ids(db: AsyncSession = Depends(get_db)):
             if prov and (not c.provider or c.provider == "dograh"):
                 c.provider = prov[:32]
             updated_calls += 1
+        if need_customer and ctx_scopes:
+            ph = _first_ctx_value(ctx_scopes, _CTX_PHONE_KEYS)
+            nm = _first_ctx_value(ctx_scopes, _CTX_NAME_KEYS)
+            if ph and not (c.customer_phone or "").strip():
+                c.customer_phone = ph[:32]
+                updated_customers += 1
+            if nm and not (c.customer_name or "").strip():
+                c.customer_name = nm[:128]
+                updated_customers += 1
 
     updated_orders = 0
     all_orders = (await db.execute(
         select(Order).options(selectinload(Order.items)))).scalars().all()
     for o in all_orders:
-        if o.provider_call_id:
-            continue
         linked = calls_by_id.get(o.call_id or "")
         if linked is None:
             for c in all_calls:
                 if o.order_number in (c.order_numbers or []):
                     linked = c
                     break
-        if linked is not None and linked.provider_call_id:
+        if linked is not None and linked.provider_call_id and not o.provider_call_id:
             o.provider_call_id = linked.provider_call_id
             if not o.provider or o.provider == "dograh":
                 o.provider = linked.provider or "dograh"
             updated_orders += 1
-        elif o.call_id and not o.call_id.startswith("voice_") and _looks_like_sid(o.call_id):
+        elif not o.provider_call_id and o.call_id and not o.call_id.startswith("voice_") and _looks_like_sid(o.call_id):
             o.provider_call_id = o.call_id.strip()[:128]
             updated_orders += 1
+        # Orders saved before the webhook carried customer details inherit
+        # them from their (possibly backfilled) call.
+        if linked is not None:
+            if not (o.customer_phone or "").strip() and (linked.customer_phone or "").strip():
+                o.customer_phone = linked.customer_phone
+                updated_customers += 1
+            if not (o.customer_name or "").strip() and (linked.customer_name or "").strip():
+                o.customer_name = linked.customer_name
+                updated_customers += 1
 
     await db.commit()
     return {"updated_calls": updated_calls, "updated_orders": updated_orders,
-            "runs_scanned": runs_scanned}
+            "updated_customers": updated_customers, "runs_scanned": runs_scanned}

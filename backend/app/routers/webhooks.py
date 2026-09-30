@@ -81,6 +81,9 @@ async def call_ended(
         if not (existing.customer_name or "").strip() and payload.resolved_customer_name():
             existing.customer_name = payload.resolved_customer_name()
             updated_fields.append("customer_name")
+        if not (existing.first_name or "").strip() and payload.resolved_first_name():
+            existing.first_name = payload.resolved_first_name()
+            updated_fields.append("first_name")
         if updated_fields:
             existing.ended_at = existing.ended_at or datetime.now(timezone.utc)
             await db.commit()
@@ -119,7 +122,7 @@ async def call_ended(
         duration_seconds=duration,
         customer_name=customer_name,
         customer_phone=customer_phone,
-        first_name=payload.first_name or "",
+        first_name=payload.resolved_first_name(),
         rsvp=payload.rsvp or "",
         transcript=payload.transcript,
         tool_calls=payload.tool_calls,
@@ -150,8 +153,9 @@ async def call_ended(
             await db.flush()
         if customer_name:
             cust.name = cust.name or customer_name
-        if payload.email:
-            cust.email = cust.email or payload.email
+        email = payload.resolved_email()
+        if email:
+            cust.email = cust.email or email
         vec = await embed_one(f"Call summary: {summary}")
         db.add(Memory(customer_id=cust.id, kind="call_summary", text=summary, embedding=vec))
 
@@ -241,7 +245,7 @@ async def _materialize_order(
         order_number=p.order_number,
         customer_name=customer_name,
         customer_phone=customer_phone,
-        email=p.email or "",
+        email=p.resolved_email(),
         order_type=order_type,
         pickup_time="",
         delivery_address=p.delivery_address or "",
