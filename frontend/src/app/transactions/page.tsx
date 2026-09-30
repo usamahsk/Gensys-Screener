@@ -540,7 +540,7 @@ export default function TransactionsPage() {
       <Pagination page={safePage} totalPages={totalPages} onChange={setPage} />
 
       <Dialog open={!!selected} onOpenChange={(open) => !open && setSelected(null)}>
-        <DialogContent className="max-h-[90vh] w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] overflow-y-auto overflow-x-hidden sm:w-[60vw] sm:max-w-[60vw]">
+        <DialogContent className="max-h-[90vh] w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] overflow-y-auto overflow-x-hidden sm:w-[80vw] sm:max-w-[80vw]">
           {selected && (
             <div className="grid min-w-0 gap-4">
               <DialogHeader className="min-w-0">
