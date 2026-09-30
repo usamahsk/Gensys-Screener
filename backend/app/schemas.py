@@ -341,6 +341,8 @@ class OrderOut(BaseModel):
     order_type: str
     table_number: str
     pickup_time: str
+    delivery_address: str = ""
+    payment_method: str = ""
     status: str
     total: Decimal
     source: str

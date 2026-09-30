@@ -127,17 +127,23 @@ Sample response:
   "found": true,
   "order": {
     "order_number": "PB-A1B",
+    "customer_name": "Rohan Mehta",
+    "customer_phone": "+919812345670",
     "status": "preparing",
     "order_type": "takeaway",
     "pickup_time": "7:30 PM",
+    "delivery_address": "",
+    "payment_method": "UPI",
     "total": "998.00",
-    "items": [ { "name": "Family Fest Bucket", "quantity": 1 } ],
+    "items": [ { "name": "Family Fest Bucket", "quantity": 1, "unit_price": "998.00", "size": "", "notes": "" } ],
     "events": [ { "status": "confirmed", "created_at": "..." }, { "status": "preparing", "created_at": "..." } ]
   }
 }
 ```
 `found: false` → tell the customer the order number wasn't found, ask to re-check.
 Convert status to natural speech: in_transit → "on its way", preparing → "being prepared".
+Read back the whole order: items with quantities and sizes, total, pickup time or
+delivery address, and payment method — all of these are in the response.
 
 ## Tool 3 — `get_customer_memory`
 
