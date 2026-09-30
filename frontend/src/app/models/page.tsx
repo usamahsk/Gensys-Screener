@@ -60,7 +60,7 @@ function ServiceFields({
         </div>
         <div className="space-y-1">
           <Label>Model</Label>
-          <Input value={value.model} onChange={set("model")} placeholder="e.g. gpt-4o, gemini-2.0-flash, nova-2" />
+          <Input value={value.model} onChange={set("model")} placeholder="e.g. gpt-4o, gemini-3.5-flash, nova-2" />
         </div>
         <div className="col-span-2 space-y-1">
           <Label>API key</Label>

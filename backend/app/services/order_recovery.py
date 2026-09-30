@@ -82,12 +82,13 @@ def _extract_phone_from_text(text: str) -> str:
     return sorted(cands, key=len, reverse=True)[0]
 
 
-_FALLBACK_MODEL = "gemini-2.0-flash"
+_FALLBACK_MODEL = "gemini-3.5-flash"
 
 
 def _redact_key(msg: str) -> str:
-    """Strip the ?key= secret httpx embeds in request URLs from log lines."""
-    return re.sub(r"key=[^'\"\s&]+", "key=***", msg)
+    """Strip secrets from log lines (delegates to the shared Gemini helper)."""
+    from app.services.gemini import redact
+    return redact(msg)
 
 
 MENU = """PIZZAS (Small / Medium / Large) — crust Regular or Thin at no extra charge:
@@ -205,7 +206,7 @@ def _apply_extraction(order: Order, req: OrderCreateRequest, call: Call, shell_e
 async def _get_google(db) -> GoogleSetting:
     row = (await db.execute(select(GoogleSetting).where(GoogleSetting.id == 1))).scalar_one_or_none()
     if not row:
-        row = GoogleSetting(id=1, api_key="", model="gemini-2.0-flash")
+        row = GoogleSetting(id=1, api_key="", model="gemini-3.5-flash")
         db.add(row)
         await db.flush()
     return row
@@ -261,35 +262,27 @@ def _text_from_json(data) -> str:
 
 
 async def _ask_gemini(transcript: str, api_key: str, model: str) -> dict | None:
-    # The dashboard-configured model may not exist on the generateContent
-    # endpoint (e.g. a 404 for a mistyped/retired name) — fall back to the
-    # known-good default instead of dropping the extraction entirely.
-    models = list(dict.fromkeys([model or _FALLBACK_MODEL, _FALLBACK_MODEL]))
-    for m in models:
-        for attempt in ("extract", "repair"):
-            prompt = _PROMPT.replace("{transcript}", transcript[:MAX_TRANSCRIPT_CHARS])
-            if attempt == "repair":
-                prompt += "\nYour previous reply was not valid JSON. Reply with JSON only."
-            try:
-                async with httpx.AsyncClient(timeout=60) as client:
-                    resp = await client.post(
-                        "https://generativelanguage.googleapis.com/v1beta/models/"
-                        f"{m}:generateContent?key={api_key}",
-                        json={"contents": [{"parts": [{"text": prompt}]}],
-                              "generationConfig": {"responseMimeType": "application/json"}},
-                    )
-                    resp.raise_for_status()
-                    parts = resp.json()["candidates"][0]["content"]["parts"]
-                    text = " ".join(p.get("text", "") for p in parts).strip()
-            except Exception as e:
-                logger.warning(
-                    f"order_recovery: Gemini call failed ({attempt}, model={m}): "
-                    f"{_redact_key(str(e))} — check the model name in Integrations → Google settings."
-                )
-                break  # try the next model (or give up after the fallback)
-            parsed = _parse_json(text)
-            if parsed is not None:
-                return parsed
+    from app.services.gemini import generate_content
+    for attempt in ("extract", "repair"):
+        prompt = _PROMPT.replace("{transcript}", transcript[:MAX_TRANSCRIPT_CHARS])
+        if attempt == "repair":
+            prompt += "\nYour previous reply was not valid JSON. Reply with JSON only."
+        try:
+            text = await generate_content(
+                api_key, model or _FALLBACK_MODEL,
+                [{"parts": [{"text": prompt}]}],
+                {"responseMimeType": "application/json"},
+                timeout=60,
+            )
+        except Exception as e:
+            logger.warning(
+                f"order_recovery: Gemini call failed ({attempt}): {_redact_key(str(e))} "
+                "— check the API key and model name in Integrations → Google settings."
+            )
+            return None
+        parsed = _parse_json(text)
+        if parsed is not None:
+            return parsed
     return None
 
 
@@ -317,7 +310,7 @@ async def extract_request_from_text(text: str, api_key: str, model: str):
     Used synchronously by the webhook (straight path) and by the background
     job (fallback path)."""
     from app.schemas import OrderCreateRequest as _OCR
-    data = await _ask_gemini(text, api_key, model or "gemini-2.0-flash")
+    data = await _ask_gemini(text, api_key, model or "gemini-3.5-flash")
     if not data or data.get("no_order"):
         return None
     try:
@@ -334,7 +327,7 @@ async def get_google_key(db) -> tuple[str, str, bool]:
     """(api_key, model, enabled) — dashboard key first, env fallback."""
     g = await _get_google(db)
     api_key = (g.api_key or "").strip() or settings.gemini_api_key
-    return api_key, (g.model or "gemini-2.0-flash"), bool(g.recovery_enabled)
+    return api_key, (g.model or "gemini-3.5-flash"), bool(g.recovery_enabled)
 
 
 async def create_order_from_transcript(
@@ -487,7 +480,7 @@ async def recover_order_from_call(call_id: str, order_number: str | None = None)
         if not text.strip():
             return {"status": "skipped", "reason": "no transcript"}
 
-        data = await _ask_gemini(text, api_key, g.model or "gemini-2.0-flash")
+        data = await _ask_gemini(text, api_key, g.model or "gemini-3.5-flash")
         if not data or data.get("no_order"):
             return {"status": "skipped", "reason": "no order in transcript"}
 

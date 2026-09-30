@@ -217,7 +217,7 @@ class GoogleSetting(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     api_key: Mapped[str] = mapped_column(Text, default="")
-    model: Mapped[str] = mapped_column(String(128), default="gemini-2.0-flash")
+    model: Mapped[str] = mapped_column(String(128), default="gemini-3.5-flash")
     recovery_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     use_audio: Mapped[bool] = mapped_column(Boolean, default=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

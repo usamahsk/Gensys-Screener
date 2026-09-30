@@ -18,7 +18,7 @@ export default function SettingsPage() {
   const [saving, setSaving] = useState(false);
   const [google, setGoogle] = useState<GoogleSetting | null>(null);
   const [googleKey, setGoogleKey] = useState("");
-  const [googleModel, setGoogleModel] = useState("gemini-2.0-flash");
+  const [googleModel, setGoogleModel] = useState("gemini-3.5-flash");
   const [recoveryEnabled, setRecoveryEnabled] = useState(true);
   const [savingGoogle, setSavingGoogle] = useState(false);
   const [langfuse, setLangfuse] = useState<LangfuseSetting | null>(null);
@@ -215,7 +215,7 @@ export default function SettingsPage() {
           </div>
           <div className="space-y-1">
             <Label>Model</Label>
-            <Input value={googleModel} onChange={(e) => setGoogleModel(e.target.value)} placeholder="gemini-2.0-flash" />
+            <Input value={googleModel} onChange={(e) => setGoogleModel(e.target.value)} placeholder="gemini-3.5-flash" />
           </div>
           <label className="flex items-center gap-2 text-sm">
             <input

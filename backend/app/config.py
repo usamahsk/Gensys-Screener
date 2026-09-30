@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     # Optional LLM for summaries / better embeddings. Empty = local fallbacks,
     # so the whole stack runs standalone with zero API keys.
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.0-flash"
+    gemini_model: str = "gemini-3.5-flash"
 
     embedding_dim: int = 256
 
