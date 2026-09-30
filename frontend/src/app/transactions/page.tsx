@@ -540,7 +540,7 @@ export default function TransactionsPage() {
       <Pagination page={safePage} totalPages={totalPages} onChange={setPage} />
 
       <Dialog open={!!selected} onOpenChange={(open) => !open && setSelected(null)}>
-        <DialogContent className="max-h-[90vh] w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] overflow-y-auto overflow-x-hidden sm:w-[80vw] sm:max-w-[80vw]">
+        <DialogContent className="max-h-[90vh] w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] overflow-y-auto overflow-x-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden sm:w-[90vw] sm:max-w-[90vw]">
           {selected && (
             <div className="grid min-w-0 gap-4">
               <DialogHeader className="min-w-0">
@@ -766,7 +766,7 @@ export default function TransactionsPage() {
               </div>
               </div>
 
-              <div className="flex justify-end gap-2">
+              <div className="sticky bottom-0 flex justify-end gap-2 border-t border-[#E2E8F4] bg-background py-3">
                 <Button variant="outline" onClick={() => setSelected(null)}>Close</Button>
                 {selected.call && (
                   <Button variant="outline" onClick={openTrace}>
