@@ -595,7 +595,7 @@ export default function TransactionsPage() {
               ) : null}
 
               <div className="grid min-w-0 gap-6 xl:grid-cols-3">
-              <div className="grid min-w-0 content-start gap-4">
+              <div className="grid min-w-0 max-w-full content-start gap-4 overflow-x-clip">
                 <div className="text-xs font-semibold tracking-wide text-muted-foreground">CUSTOMER & ORDERS</div>
 
                 <div className="rounded-xl border border-[#E2E8F4] p-3">
@@ -668,7 +668,7 @@ export default function TransactionsPage() {
               ))}
 
               </div>
-              <div className="grid min-w-0 content-start gap-4 xl:border-l xl:border-[#E2E8F4] xl:pl-6">
+              <div className="grid min-w-0 max-w-full content-start gap-4 overflow-x-clip xl:border-l xl:border-[#E2E8F4] xl:pl-6">
                 <div className="text-xs font-semibold tracking-wide text-muted-foreground">RECORDING & CONVERSATION</div>
               {/* single recording + chat + tool calls */}
               <div className="space-y-2">
@@ -741,7 +741,7 @@ export default function TransactionsPage() {
               </div>
 
               </div>
-              <div className="grid min-w-0 content-start gap-4 xl:border-l xl:border-[#E2E8F4] xl:pl-6">
+              <div className="grid min-w-0 max-w-full content-start gap-4 overflow-x-clip xl:border-l xl:border-[#E2E8F4] xl:pl-6">
                 <div className="text-xs font-semibold tracking-wide text-muted-foreground">CONTEXT</div>
                 <div className="rounded-xl border border-[#E2E8F4] p-3">
                   <div className="mb-1 text-xs font-semibold text-muted-foreground">Initial context</div>

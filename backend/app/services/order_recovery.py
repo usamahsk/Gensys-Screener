@@ -82,6 +82,14 @@ def _extract_phone_from_text(text: str) -> str:
     return sorted(cands, key=len, reverse=True)[0]
 
 
+_FALLBACK_MODEL = "gemini-2.0-flash"
+
+
+def _redact_key(msg: str) -> str:
+    """Strip the ?key= secret httpx embeds in request URLs from log lines."""
+    return re.sub(r"key=[^'\"\s&]+", "key=***", msg)
+
+
 MENU = """PIZZAS (Small / Medium / Large) — crust Regular or Thin at no extra charge:
 - Margherita Pizza (Veg): 8.99 / 11.99 / 14.99
 - Pepperoni Pizza (Non-Veg): 9.99 / 12.99 / 15.99
@@ -253,27 +261,35 @@ def _text_from_json(data) -> str:
 
 
 async def _ask_gemini(transcript: str, api_key: str, model: str) -> dict | None:
-    for attempt in ("extract", "repair"):
-        prompt = _PROMPT.replace("{transcript}", transcript[:MAX_TRANSCRIPT_CHARS])
-        if attempt == "repair":
-            prompt += "\nYour previous reply was not valid JSON. Reply with JSON only."
-        try:
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(
-                    "https://generativelanguage.googleapis.com/v1beta/models/"
-                    f"{model}:generateContent?key={api_key}",
-                    json={"contents": [{"parts": [{"text": prompt}]}],
-                          "generationConfig": {"responseMimeType": "application/json"}},
+    # The dashboard-configured model may not exist on the generateContent
+    # endpoint (e.g. a 404 for a mistyped/retired name) — fall back to the
+    # known-good default instead of dropping the extraction entirely.
+    models = list(dict.fromkeys([model or _FALLBACK_MODEL, _FALLBACK_MODEL]))
+    for m in models:
+        for attempt in ("extract", "repair"):
+            prompt = _PROMPT.replace("{transcript}", transcript[:MAX_TRANSCRIPT_CHARS])
+            if attempt == "repair":
+                prompt += "\nYour previous reply was not valid JSON. Reply with JSON only."
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    resp = await client.post(
+                        "https://generativelanguage.googleapis.com/v1beta/models/"
+                        f"{m}:generateContent?key={api_key}",
+                        json={"contents": [{"parts": [{"text": prompt}]}],
+                              "generationConfig": {"responseMimeType": "application/json"}},
+                    )
+                    resp.raise_for_status()
+                    parts = resp.json()["candidates"][0]["content"]["parts"]
+                    text = " ".join(p.get("text", "") for p in parts).strip()
+            except Exception as e:
+                logger.warning(
+                    f"order_recovery: Gemini call failed ({attempt}, model={m}): "
+                    f"{_redact_key(str(e))} — check the model name in Integrations → Google settings."
                 )
-                resp.raise_for_status()
-                parts = resp.json()["candidates"][0]["content"]["parts"]
-                text = " ".join(p.get("text", "") for p in parts).strip()
-        except Exception as e:
-            logger.warning(f"order_recovery: Gemini call failed ({attempt}): {e}")
-            return None
-        parsed = _parse_json(text)
-        if parsed is not None:
-            return parsed
+                break  # try the next model (or give up after the fallback)
+            parsed = _parse_json(text)
+            if parsed is not None:
+                return parsed
     return None
 
 
