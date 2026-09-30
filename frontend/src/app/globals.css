@@ -101,15 +101,11 @@ body {
   }
 }
 
-/* slim scrollbars for dialogs */
+/* hidden scrollbars everywhere — scrolling still works (wheel, touch, keys) */
+* {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
 *::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-*::-webkit-scrollbar-thumb {
-  background: #c3d2ec;
-  border-radius: 8px;
-}
-*::-webkit-scrollbar-track {
-  background: transparent;
+  display: none;
 }
