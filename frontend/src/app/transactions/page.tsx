@@ -44,8 +44,6 @@ import {
   Search,
   Clock,
   User,
-  Mic,
-  Bot,
   FileText,
   ExternalLink,
   Volume2,
@@ -92,14 +90,60 @@ function TypeBadge({ type }: { type: string }) {
   );
 }
 
+interface RunToolCall {
+  name: string;
+  args: string;
+  result: string;
+}
+
 interface RunEvidence {
   recordingUrl: string | null;
   transcriptUrl: string | null;
   transcript: string;
   gatheredContext: Record<string, unknown>;
   initialContext: Record<string, unknown>;
+  toolCalls: RunToolCall[];
   runId: number | null;
   workflowId: number | null;
+}
+
+function stringifyToolValue(v: unknown, max = 2000): string {
+  if (typeof v === "string") return v.slice(0, max);
+  if (v === null || v === undefined) return "";
+  try {
+    return JSON.stringify(v, null, 2).slice(0, max);
+  } catch {
+    return String(v).slice(0, max);
+  }
+}
+
+/** Full tool-call log like the Dograh run details: name + arguments + result. */
+function toolCallsFromRunDetail(detail: Record<string, unknown>): RunToolCall[] {
+  const logs = (detail["logs"] as Record<string, unknown>) || {};
+  const raw = logs["realtime_feedback_events"];
+  if (!Array.isArray(raw)) return [];
+  const started = new Map<string, { name: string; args: string }>();
+  const out: RunToolCall[] = [];
+  for (const e of raw) {
+    if (typeof e !== "object" || e === null) continue;
+    const type = String((e as Record<string, unknown>)["type"] || "");
+    const p = ((e as Record<string, unknown>)["payload"] as Record<string, unknown>) || {};
+    if (type === "rtf-function-call-start") {
+      started.set(String(p["tool_call_id"] || ""), {
+        name: String(p["function_name"] || "?"),
+        args: stringifyToolValue(p["arguments"]),
+      });
+    } else if (type === "rtf-function-call-end") {
+      const s = started.get(String(p["tool_call_id"] || "")) || {
+        name: String(p["function_name"] || "?"),
+        args: "",
+      };
+      started.delete(String(p["tool_call_id"] || ""));
+      out.push({ name: s.name, args: s.args, result: stringifyToolValue(p["result"]) });
+    }
+  }
+  for (const s of started.values()) out.push({ name: s.name, args: s.args, result: "" });
+  return out;
 }
 
 function proxiedFileUrl(url: string, filename?: string, download = false) {
@@ -156,7 +200,6 @@ export default function TransactionsPage() {
 
   const [selected, setSelected] = useState<TransactionRow | null>(null);
   const [backfilling, setBackfilling] = useState(false);
-  const [downloadingFile, setDownloadingFile] = useState(false);
   const [callDetail, setCallDetail] = useState<CallDetail | null>(null);
   const [orderDetails, setOrderDetails] = useState<OrderDetail[]>([]);
   const [runEvidence, setRunEvidence] = useState<RunEvidence | null>(null);
@@ -269,46 +312,12 @@ export default function TransactionsPage() {
         transcript: t.transcript,
         gatheredContext: (detail.gathered_context as Record<string, unknown>) || {},
         initialContext: (detail.initial_context as Record<string, unknown>) || {},
+        toolCalls: toolCallsFromRunDetail(detail),
         runId,
         workflowId,
       });
     } catch {
       setRunEvidence(null);
-    }
-  };
-
-  const downloadRunFile = async (kind: "transcript" | "recording") => {
-    // Dograh-style: open a freshly-minted public URL straight in the browser
-    // so the file downloads directly to the PC (no backend hop, no egress
-    // permission issues on the server). Falls back to the on-screen text for
-    // transcripts when the voice file is gone.
-    if (!runEvidence?.runId || !runEvidence?.workflowId) {
-      toast.error("No run linked to this transaction");
-      return;
-    }
-    setDownloadingFile(true);
-    try {
-      const detail = await apiClient.dograhRunDetail(runEvidence.runId, runEvidence.workflowId);
-      const freshUrl =
-        kind === "transcript"
-          ? detail.transcript_public_url || detail.transcript_url
-          : detail.recording_public_url || detail.recording_url;
-      if (typeof freshUrl !== "string" || !freshUrl) {
-        throw new Error(`No ${kind} URL on this run`);
-      }
-      window.open(freshUrl, "_blank", "noopener,noreferrer");
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : "Download failed";
-      if (kind === "transcript" && runEvidence?.transcript) {
-        // The stored file is gone on the voice platform (expired/purged),
-        // but we already have the text on screen — save that instead.
-        downloadTextFile(`transcript-run-${runEvidence.runId}.txt`, runEvidence.transcript);
-        toast.warning(`Voice file unavailable (${msg}) — saved the on-screen transcript text instead.`);
-      } else {
-        toast.error(msg);
-      }
-    } finally {
-      setDownloadingFile(false);
     }
   };
 
@@ -346,6 +355,38 @@ export default function TransactionsPage() {
         callId: selected.call?.call_id || selected.orders[0]?.call_id || "",
       }
     : null;
+
+  // ---- dialog view-model ----
+  // Single recording: the combined call recording first, run recording next,
+  // per-channel audio only as a last resort.
+  const recordingSrc =
+    callDetail?.recording_url ||
+    (typeof runEvidence?.recordingUrl === "string" ? runEvidence.recordingUrl : "") ||
+    callDetail?.user_recording_url ||
+    callDetail?.bot_recording_url ||
+    "";
+  // Conversation: saved turns first, run transcript text as fallback.
+  const turns =
+    callDetail && callDetail.transcript.length > 0
+      ? callDetail.transcript
+      : runEvidence?.transcript
+        ? parseRawTranscript(runEvidence.transcript)
+        : [];
+  // Tool calls: full args/result from the Dograh run when linked, else the
+  // saved tool-call log.
+  const savedTools = (callDetail?.tool_calls || []).map((t) => ({
+    name: t.name,
+    args: t.args_summary || "",
+    result:
+      typeof t.result === "string"
+        ? t.result
+        : t.result == null
+          ? ""
+          : JSON.stringify(t.result, null, 2),
+  }));
+  const allTools = runEvidence && runEvidence.toolCalls.length > 0 ? runEvidence.toolCalls : savedTools;
+  const initialContext = runEvidence?.initialContext || {};
+  const gatheredContext = runEvidence?.gatheredContext || {};
 
   return (
     <div className="space-y-4">
@@ -553,9 +594,26 @@ export default function TransactionsPage() {
                 <div className="rounded-xl bg-[#EAF1FF] p-3 text-sm">{selected.call.summary}</div>
               ) : null}
 
-              <div className="grid min-w-0 gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+              <div className="grid min-w-0 gap-6 xl:grid-cols-3">
               <div className="grid min-w-0 content-start gap-4">
-                <div className="text-xs font-semibold tracking-wide text-muted-foreground">ORDER DETAILS</div>
+                <div className="text-xs font-semibold tracking-wide text-muted-foreground">CUSTOMER & ORDERS</div>
+
+                <div className="rounded-xl border border-[#E2E8F4] p-3">
+                  <div className="flex items-center gap-1.5 text-sm font-medium">
+                    <User className="h-3.5 w-3.5 text-muted-foreground" />
+                    {callDetail?.customer_name || selected.call?.customer_name || selected.orders[0]?.customer_name || "Unknown"}
+                  </div>
+                  <div className="mt-0.5 text-xs text-muted-foreground">
+                    {callDetail?.customer_phone || selected.call?.customer_phone || selected.orders[0]?.customer_phone || "—"}
+                    {(callDetail?.first_name || selected.call?.first_name) && (
+                      <> · {callDetail?.first_name || selected.call?.first_name}</>
+                    )}
+                  </div>
+                  <div className="mt-0.5 text-xs text-muted-foreground">
+                    {fmtDuration(selected.call?.duration_seconds || 0)}
+                    {selected.started_at && <> · {fmtDateTime(selected.started_at)}</>}
+                  </div>
+                </div>
 
               {/* linked orders with items + timeline */}
               {(orderDetails.length > 0 ? orderDetails : selected.orders).map((o) => (
@@ -611,176 +669,100 @@ export default function TransactionsPage() {
 
               </div>
               <div className="grid min-w-0 content-start gap-4 xl:border-l xl:border-[#E2E8F4] xl:pl-6">
-                <div className="text-xs font-semibold tracking-wide text-muted-foreground">CALL + RUN DETAILS</div>
-              {/* call media + transcript */}
-              {callDetail && (
-                <div className="space-y-2">
-                  {callDetail.recording_url && (
-                    <div className="rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3">
-                      <div className="mb-1 flex flex-wrap items-center justify-between gap-1 text-xs font-semibold text-muted-foreground">
-                        <span className="flex items-center gap-1"><Volume2 className="h-3.5 w-3.5" /> Recording</span>
-                        <span className="flex gap-1">
-                          <a
-                            href={proxiedFileUrl(callDetail.recording_url, `recording-${callDetail.call_id}.wav`, true)}
-                            target="_blank"
-                            rel="noreferrer"
-                          >
-                            <Button size="sm" variant="outline"><Download className="mr-1 h-3 w-3" /> Download</Button>
-                          </a>
-                        </span>
-                      </div>
-                      <audio controls className="w-full min-w-0" src={proxiedFileUrl(callDetail.recording_url)} />
+                <div className="text-xs font-semibold tracking-wide text-muted-foreground">RECORDING & CONVERSATION</div>
+              {/* single recording + chat + tool calls */}
+              <div className="space-y-2">
+                {recordingSrc ? (
+                  <div className="rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3">
+                    <div className="mb-1 flex flex-wrap items-center justify-between gap-1 text-xs font-semibold text-muted-foreground">
+                      <span className="flex items-center gap-1"><Volume2 className="h-3.5 w-3.5" /> Recording</span>
+                      <a
+                        href={proxiedFileUrl(recordingSrc, `recording-${selected.call?.call_id || "call"}.wav`, true)}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        <Button size="sm" variant="outline"><Download className="mr-1 h-3 w-3" /> Download</Button>
+                      </a>
                     </div>
-                  )}
-                  {callDetail.user_recording_url && (
-                    <div className="rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3">
-                      <div className="mb-1 flex flex-wrap items-center justify-between gap-1 text-xs font-semibold text-muted-foreground">
-                        <span className="flex items-center gap-1"><Mic className="h-3.5 w-3.5" /> Caller audio</span>
-                        <a
-                          href={proxiedFileUrl(callDetail.user_recording_url, `caller-${callDetail.call_id}.wav`, true)}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          <Button size="sm" variant="outline"><Download className="mr-1 h-3 w-3" /> Download</Button>
-                        </a>
-                      </div>
-                      <audio controls className="w-full min-w-0" src={proxiedFileUrl(callDetail.user_recording_url)} />
-                    </div>
-                  )}
-                  {callDetail.bot_recording_url && (
-                    <div className="rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3">
-                      <div className="mb-1 flex flex-wrap items-center justify-between gap-1 text-xs font-semibold text-muted-foreground">
-                        <span className="flex items-center gap-1"><Bot className="h-3.5 w-3.5" /> Agent audio</span>
-                        <a
-                          href={proxiedFileUrl(callDetail.bot_recording_url, `agent-${callDetail.call_id}.wav`, true)}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          <Button size="sm" variant="outline"><Download className="mr-1 h-3 w-3" /> Download</Button>
-                        </a>
-                      </div>
-                      <audio controls className="w-full min-w-0" src={proxiedFileUrl(callDetail.bot_recording_url)} />
-                    </div>
-                  )}
-                  {callDetail.transcript.length > 0 && (
-                    <div className="min-w-0">
-                      <div className="mb-1 flex flex-wrap items-center justify-between gap-1 text-xs font-semibold text-muted-foreground">
-                        <span>Transcript</span>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() =>
-                            downloadTextFile(
-                              `transcript-${callDetail.call_id}.txt`,
-                              turnsToText(callDetail.transcript)
-                            )
-                          }
-                        >
-                          <Download className="mr-1 h-3 w-3" /> Download transcript
-                        </Button>
-                      </div>
-                      <ChatTranscript turns={callDetail.transcript} />
-                    </div>
-                  )}
-                  {callDetail.tool_calls.length > 0 && (
-                    <div>
-                      <div className="mb-1 text-xs font-semibold text-muted-foreground">Tool calls</div>
-                      <div className="space-y-1">
-                        {callDetail.tool_calls.map((t, i) => (
-                          <div key={i} className="flex items-center gap-2 rounded-lg bg-muted/60 px-3 py-1.5 font-mono text-xs">
-                            <Badge variant="outline">{t.name}</Badge>
-                            <span className="truncate text-muted-foreground">{t.args_summary}</span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
+                    <audio controls className="w-full min-w-0" src={proxiedFileUrl(recordingSrc)} />
+                  </div>
+                ) : (
+                  <div className="text-xs text-muted-foreground">No recording available.</div>
+                )}
+                <div className="min-w-0">
+                  <div className="mb-1 flex flex-wrap items-center justify-between gap-1 text-xs font-semibold text-muted-foreground">
+                    <span className="flex items-center gap-1">
+                      Conversation
+                      {turns.length > 0 && <Badge variant="outline" className="ml-1">{turns.length} turns</Badge>}
+                    </span>
+                    {turns.length > 0 && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() =>
+                          downloadTextFile(
+                            `transcript-${selected.call?.call_id || "call"}.txt`,
+                            turnsToText(turns)
+                          )
+                        }
+                      >
+                        <Download className="mr-1 h-3 w-3" /> Download transcript
+                      </Button>
+                    )}
+                  </div>
+                  {detailLoading && turns.length === 0 ? (
+                    <div className="text-sm text-muted-foreground">Loading conversation…</div>
+                  ) : (
+                    <ChatTranscript turns={turns} />
                   )}
                 </div>
-              )}
-
-              {/* run evidence from the voice platform */}
-              {runEvidence && (
-                <div className="space-y-2 rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div className="text-xs font-semibold text-muted-foreground">RUN EVIDENCE — VOICE PLATFORM</div>
-                    <div className="flex flex-wrap gap-1">
-                      {runEvidence.recordingUrl && (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={downloadingFile}
-                          onClick={() => downloadRunFile("recording")}
-                        >
-                          <Download className="mr-1 h-3 w-3" /> Recording
-                        </Button>
-                      )}
-                      {(runEvidence.transcriptUrl || runEvidence.transcript) && (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          disabled={downloadingFile}
-                          onClick={() => downloadRunFile("transcript")}
-                        >
-                          <Download className="mr-1 h-3 w-3" /> Transcript file
-                        </Button>
-                      )}
-                      {runEvidence.transcript && (
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          onClick={() =>
-                            downloadTextFile(
-                              `transcript-run-${runEvidence.runId ?? "unknown"}.txt`,
-                              runEvidence.transcript
-                            )
-                          }
-                        >
-                          <Download className="mr-1 h-3 w-3" /> Download transcript
-                        </Button>
-                      )}
-                      <Button size="sm" variant="outline" onClick={openTrace}>
-                        <ExternalLink className="mr-1 h-3 w-3" /> Trace
-                      </Button>
+                {allTools.length > 0 && (
+                  <div>
+                    <div className="mb-1 text-xs font-semibold text-muted-foreground">Tool calls</div>
+                    <div className="space-y-1">
+                      {allTools.map((t, i) => (
+                        <details key={i} className="group rounded-lg bg-muted/60 px-3 py-1.5">
+                          <summary className="flex cursor-pointer list-none items-center gap-2 font-mono text-xs [&::-webkit-details-marker]:hidden">
+                            <span className="inline-block transition-transform group-open:rotate-90">▸</span>
+                            <Badge variant="outline">{t.name}</Badge>
+                            <span className="truncate text-muted-foreground">{t.args.slice(0, 120)}</span>
+                          </summary>
+                          {t.args && (
+                            <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-muted-foreground">{t.args}</pre>
+                          )}
+                          {t.result && (
+                            <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words border-t border-[#E2E8F4] pt-1 font-mono text-[11px]">{t.result}</pre>
+                          )}
+                        </details>
+                      ))}
                     </div>
                   </div>
-                  {runEvidence.recordingUrl && (
-                    <audio
-                      controls
-                      className="w-full min-w-0"
-                      src={proxiedFileUrl(runEvidence.recordingUrl)}
-                    />
-                  )}
-                  {runEvidence.transcript ? (
-                    <div className="min-w-0">
-                      <ChatTranscript turns={parseRawTranscript(runEvidence.transcript)} />
-                    </div>
+                )}
+              </div>
+
+              </div>
+              <div className="grid min-w-0 content-start gap-4 xl:border-l xl:border-[#E2E8F4] xl:pl-6">
+                <div className="text-xs font-semibold tracking-wide text-muted-foreground">CONTEXT</div>
+                <div className="rounded-xl border border-[#E2E8F4] p-3">
+                  <div className="mb-1 text-xs font-semibold text-muted-foreground">Initial context</div>
+                  {Object.keys(initialContext).length > 0 ? (
+                    <pre className="max-h-72 overflow-auto break-words whitespace-pre-wrap font-mono text-xs">
+                      {JSON.stringify(initialContext, null, 2)}
+                    </pre>
                   ) : (
-                    <div className="text-xs text-muted-foreground">No run transcript.</div>
-                  )}
-                  {Object.keys(runEvidence.initialContext).length > 0 && (
-                    <details className="group rounded-xl border border-[#E2E8F4] bg-white">
-                      <summary className="cursor-pointer list-none px-3 py-2 text-xs font-semibold text-[#000E49] [&::-webkit-details-marker]:hidden">
-                        <span className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>
-                        Initial context
-                      </summary>
-                      <pre className="max-h-48 overflow-auto border-t border-[#E2E8F4] p-3 font-mono text-xs break-words whitespace-pre-wrap">
-                        {JSON.stringify(runEvidence.initialContext, null, 2)}
-                      </pre>
-                    </details>
-                  )}
-                  {Object.keys(runEvidence.gatheredContext).length > 0 && (
-                    <details className="group rounded-xl border border-[#E2E8F4] bg-white">
-                      <summary className="cursor-pointer list-none px-3 py-2 text-xs font-semibold text-[#000E49] [&::-webkit-details-marker]:hidden">
-                        <span className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>
-                        Gathered context
-                      </summary>
-                      <pre className="max-h-48 overflow-auto border-t border-[#E2E8F4] p-3 font-mono text-xs break-words whitespace-pre-wrap">
-                        {JSON.stringify(runEvidence.gatheredContext, null, 2)}
-                      </pre>
-                    </details>
+                    <div className="text-xs text-muted-foreground">No initial context.</div>
                   )}
                 </div>
-              )}
+                <div className="rounded-xl border border-[#E2E8F4] p-3">
+                  <div className="mb-1 text-xs font-semibold text-muted-foreground">Gathered context</div>
+                  {Object.keys(gatheredContext).length > 0 ? (
+                    <pre className="max-h-72 overflow-auto break-words whitespace-pre-wrap font-mono text-xs">
+                      {JSON.stringify(gatheredContext, null, 2)}
+                    </pre>
+                  ) : (
+                    <div className="text-xs text-muted-foreground">No gathered context.</div>
+                  )}
+                </div>
               </div>
               </div>
 
