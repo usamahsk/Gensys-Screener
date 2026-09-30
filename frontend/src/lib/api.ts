@@ -248,7 +248,7 @@ export const apiClient = {
     const qs = new URLSearchParams(
       Object.entries(params).filter(([, v]) => v !== undefined && v !== "") as [string, string][]
     );
-    return api<{ url: string; trace_id: string; source: string }>(
+    return api<{ url: string; trace_id: string; source: string; matched_key?: string }>(
       `/api/integration/langfuse/trace-url?${qs}`
     );
   },

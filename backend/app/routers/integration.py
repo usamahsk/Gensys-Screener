@@ -733,23 +733,53 @@ def _trace_url(host: str, project_id: str, trace_id: str) -> str:
     return f"{base}/traces/{tid}"
 
 
-def _trace_id_from_detail(detail: dict) -> str:
-    """Prefer an explicit trace id/url Dograh returns, else fall back to the run id."""
-    for key in ("langfuse_trace_url", "langfuse_url", "trace_url"):
-        v = detail.get(key)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    for scope in (detail, detail.get("logs") or {}, detail.get("gathered_context") or {}):
-        if isinstance(scope, dict):
-            for key in ("langfuse_trace_id", "langfuse_trace", "trace_id", "langfuseTraceId"):
-                v = scope.get(key)
-                if isinstance(v, str) and v.strip():
-                    return v.strip()
-    for key in ("run_id", "id"):
-        v = detail.get(key)
-        if v is not None and str(v).strip():
-            return str(v).strip()
-    return ""
+# Explicit key names Dograh (or its variants) may use for the trace link.
+_TRACE_URL_KEYS = {
+    "langfuse_trace_url", "langfuse_url", "trace_url", "traceurl",
+    "traceUrl", "langfuse_link", "langfuseLink", "observability_url",
+}
+_TRACE_ID_KEYS = {
+    "langfuse_trace_id", "langfuse_trace", "trace_id", "traceid",
+    "langfusetraceid", "traceId", "langfuseTraceId",
+}
+
+
+def _find_langfuse_trace(detail: dict) -> tuple[str, str]:
+    """Deep-scan a Dograh run detail for the Langfuse trace link.
+
+    Dograh opens the Langfuse trace for a run, so the run detail is the
+    source of truth — the numeric run id is NOT a valid Langfuse trace id
+    (e.g. /traces/1499 404s). Walks the whole payload (any nesting, any
+    key spelling) and returns (value, dotted key path). A full trace URL
+    wins over a bare trace id.
+    """
+    best_url: tuple[str, str] = ("", "")
+    best_id: tuple[str, str] = ("", "")
+    stack: list[tuple[str, Any]] = [("", detail)]
+    while stack:
+        path, node = stack.pop()
+        if isinstance(node, dict):
+            for k, v in node.items():
+                p = f"{path}.{k}" if path else str(k)
+                stack.append((p, v))
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                stack.append((f"{path}[{i}]", v))
+        elif isinstance(node, str) and node.strip():
+            s = node.strip()
+            if "{{" in s or " " in s or len(s) > 500:
+                continue
+            leaf = path.split(".")[-1].lower() if path else ""
+            if s.startswith("http"):
+                if "langfuse" in s and "/traces/" in s:
+                    return s, path  # exact Langfuse trace link — done
+                if not best_url[0] and (leaf in _TRACE_URL_KEYS or "langfuse" in leaf):
+                    best_url = (s, path)
+            elif not best_id[0] and (leaf in _TRACE_ID_KEYS or "langfuse" in leaf):
+                best_id = (s, path)
+    if best_url[0]:
+        return best_url
+    return best_id
 
 
 @langfuse_router.get("", response_model=LangfuseSettingResponse)
@@ -822,33 +852,44 @@ async def langfuse_trace_url(
 ):
     """Deep-link one run/call to its Langfuse trace.
 
-    Priority: explicit ?trace_id= → trace id found in the Dograh run detail →
-    run_id / call_id as the trace id (standard Dograh→Langfuse naming).
+    Priority: explicit ?trace_id= → the trace link Dograh itself carries on
+    the run detail (same URL Dograh opens) → call_id as a best guess (only
+    when no run is linked). The numeric run id is never used — it is not a
+    valid Langfuse trace id.
     """
     s = await _get_langfuse(db)
     if not s.enabled:
         raise HTTPException(400, "Langfuse integration is disabled")
     tid = (trace_id or "").strip()
-    source = "explicit"
-    if not tid and run_id and workflow_id:
+    if tid:
+        return {"url": _trace_url(s.host, s.project_id or "", tid),
+                "trace_id": tid, "source": "explicit"}
+    if run_id and workflow_id:
         d = await _get_setting(db)
         if not d.api_key:
             raise HTTPException(400, "No voice platform API key configured")
         try:
             detail = await dograh_client.get_run_detail(d.api_key, d.base_url, workflow_id, run_id)
-            found = _trace_id_from_detail(detail)
-            if found.startswith("http"):
-                return {"url": found, "trace_id": found, "source": "dograh"}
-            tid = found
-            source = "dograh-run"
         except Exception as e:
             raise HTTPException(502, f"Voice platform request failed: {e}")
-    if not tid:
-        tid = str(run_id or "").strip() or (call_id or "").strip()
-        source = "run-id" if run_id else "call-id"
-    if not tid:
-        raise HTTPException(400, "Pass ?trace_id=, ?run_id=&workflow_id=, or ?call_id=")
-    return {"url": _trace_url(s.host, s.project_id or "", tid), "trace_id": tid, "source": source}
+        found, matched_key = _find_langfuse_trace(detail if isinstance(detail, dict) else {})
+        if found.startswith("http"):
+            return {"url": found, "trace_id": found,
+                    "source": "dograh", "matched_key": matched_key}
+        if found:
+            return {"url": _trace_url(s.host, s.project_id or "", found),
+                    "trace_id": found, "source": "dograh", "matched_key": matched_key}
+        top = sorted(detail.keys())[:30] if isinstance(detail, dict) else []
+        raise HTTPException(404,
+            "This run carries no Langfuse trace link in its run detail, so there is "
+            "nothing valid to open (the run id itself is not a trace id). "
+            f"Top-level run keys: {', '.join(top) or 'none'}. "
+            "Open the run in Dograh, copy its trace link, and retry with ?trace_id=.")
+    if (call_id or "").strip():
+        cid = call_id.strip()
+        return {"url": _trace_url(s.host, s.project_id or "", cid),
+                "trace_id": cid, "source": "call-id"}
+    raise HTTPException(400, "Pass ?trace_id=, ?run_id=&workflow_id=, or ?call_id=")
 
 
 # ---------- Knowledge base (Dograh org documents) ----------
