@@ -598,7 +598,7 @@ export default function TransactionsPage() {
               <div className="grid min-w-0 max-w-full content-start gap-4 overflow-x-clip">
                 <div className="text-xs font-semibold tracking-wide text-muted-foreground">CUSTOMER & ORDERS</div>
 
-                <div className="rounded-xl border border-[#E2E8F4] p-3">
+                <div className="min-w-0 rounded-xl border border-[#E2E8F4] p-3">
                   <div className="flex items-center gap-1.5 text-sm font-medium">
                     <User className="h-3.5 w-3.5 text-muted-foreground" />
                     {callDetail?.customer_name || selected.call?.customer_name || selected.orders[0]?.customer_name || "Unknown"}
@@ -617,7 +617,7 @@ export default function TransactionsPage() {
 
               {/* linked orders with items + timeline */}
               {(orderDetails.length > 0 ? orderDetails : selected.orders).map((o) => (
-                <div key={o.order_number} className="rounded-xl border border-[#E2E8F4] p-3">
+                <div key={o.order_number} className="min-w-0 rounded-xl border border-[#E2E8F4] p-3">
                   <div className="mb-2 flex flex-wrap items-center gap-2">
                     <span className="font-mono text-sm font-semibold">{o.order_number}</span>
                     <Badge variant="secondary" className={`${statusClass(o.status)} hover:${statusClass(o.status)}`}>
@@ -673,7 +673,7 @@ export default function TransactionsPage() {
               {/* single recording + chat + tool calls */}
               <div className="min-w-0 space-y-2">
                 {recordingSrc ? (
-                  <div className="rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3">
+                  <div className="min-w-0 rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3">
                     <div className="mb-1 flex flex-wrap items-center justify-between gap-1 text-xs font-semibold text-muted-foreground">
                       <span className="flex items-center gap-1"><Volume2 className="h-3.5 w-3.5" /> Recording</span>
                       <a
@@ -743,7 +743,7 @@ export default function TransactionsPage() {
               </div>
               <div className="grid min-w-0 max-w-full content-start gap-4 overflow-x-clip xl:border-l xl:border-[#E2E8F4] xl:pl-6">
                 <div className="text-xs font-semibold tracking-wide text-muted-foreground">CONTEXT</div>
-                <div className="rounded-xl border border-[#E2E8F4] p-3">
+                <div className="min-w-0 rounded-xl border border-[#E2E8F4] p-3">
                   <div className="mb-1 text-xs font-semibold text-muted-foreground">Initial context</div>
                   {Object.keys(initialContext).length > 0 ? (
                     <pre className="max-h-72 overflow-auto break-words whitespace-pre-wrap font-mono text-xs">
@@ -753,7 +753,7 @@ export default function TransactionsPage() {
                     <div className="text-xs text-muted-foreground">No initial context.</div>
                   )}
                 </div>
-                <div className="rounded-xl border border-[#E2E8F4] p-3">
+                <div className="min-w-0 rounded-xl border border-[#E2E8F4] p-3">
                   <div className="mb-1 text-xs font-semibold text-muted-foreground">Gathered context</div>
                   {Object.keys(gatheredContext).length > 0 ? (
                     <pre className="max-h-72 overflow-auto break-words whitespace-pre-wrap font-mono text-xs">
