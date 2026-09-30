@@ -159,9 +159,9 @@ export default function AgentViewPage() {
                   <div className="mt-3 space-y-1">
                     <div className="text-xs font-semibold text-muted-foreground">What the voice agent already did</div>
                     {toolCalls.map((t, i) => (
-                      <div key={i} className="flex items-center gap-2 rounded-lg bg-muted/60 px-3 py-1.5 font-mono text-xs">
-                        <Badge variant="outline">{t.name}</Badge>
-                        <span className="truncate text-muted-foreground">{t.args_summary}</span>
+                      <div key={i} className="flex min-w-0 items-center gap-2 rounded-lg bg-muted/60 px-3 py-1.5 font-mono text-xs">
+                        <Badge variant="outline" className="shrink-0">{t.name}</Badge>
+                        <span className="min-w-0 flex-1 truncate text-muted-foreground">{t.args_summary}</span>
                       </div>
                     ))}
                   </div>

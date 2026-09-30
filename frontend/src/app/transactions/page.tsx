@@ -671,7 +671,7 @@ export default function TransactionsPage() {
               <div className="grid min-w-0 max-w-full content-start gap-4 overflow-x-clip xl:border-l xl:border-[#E2E8F4] xl:pl-6">
                 <div className="text-xs font-semibold tracking-wide text-muted-foreground">RECORDING & CONVERSATION</div>
               {/* single recording + chat + tool calls */}
-              <div className="space-y-2">
+              <div className="min-w-0 space-y-2">
                 {recordingSrc ? (
                   <div className="rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3">
                     <div className="mb-1 flex flex-wrap items-center justify-between gap-1 text-xs font-semibold text-muted-foreground">
@@ -722,10 +722,10 @@ export default function TransactionsPage() {
                     <div className="space-y-1">
                       {allTools.map((t, i) => (
                         <details key={i} className="group rounded-lg bg-muted/60 px-3 py-1.5">
-                          <summary className="flex cursor-pointer list-none items-center gap-2 font-mono text-xs [&::-webkit-details-marker]:hidden">
-                            <span className="inline-block transition-transform group-open:rotate-90">▸</span>
-                            <Badge variant="outline">{t.name}</Badge>
-                            <span className="truncate text-muted-foreground">{t.args.slice(0, 120)}</span>
+                          <summary className="flex min-w-0 cursor-pointer list-none items-center gap-2 font-mono text-xs [&::-webkit-details-marker]:hidden">
+                            <span className="inline-block shrink-0 transition-transform group-open:rotate-90">▸</span>
+                            <Badge variant="outline" className="shrink-0">{t.name}</Badge>
+                            <span className="min-w-0 flex-1 truncate text-muted-foreground">{t.args.slice(0, 120)}</span>
                           </summary>
                           {t.args && (
                             <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] text-muted-foreground">{t.args}</pre>
