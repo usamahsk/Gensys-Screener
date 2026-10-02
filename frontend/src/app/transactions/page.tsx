@@ -1070,11 +1070,15 @@ export default function TransactionsPage() {
                 </div>
               )}
 
-              {callDetail?.summary ? (
-                <div className="rounded-xl bg-[#EAF1FF] p-3 text-sm">{callDetail.summary}</div>
-              ) : selected.call?.summary ? (
-                <div className="rounded-xl bg-[#EAF1FF] p-3 text-sm">{selected.call.summary}</div>
-              ) : null}
+              {(() => {
+                const summaryText = callDetail?.summary || selected.call?.summary || "";
+                // Hide the retired transfer placeholder on old rows — the
+                // transfer reason already shows as the disposition chip.
+                if (!summaryText.trim() || /full conversation summary arrives when the call ends/i.test(summaryText)) {
+                  return null;
+                }
+                return <div className="rounded-xl bg-[#EAF1FF] p-3 text-sm">{summaryText}</div>;
+              })()}
 
               <div className="grid min-w-0 gap-6 xl:grid-cols-3">
               <div className="grid min-w-0 max-w-full content-start gap-4 overflow-x-clip">

@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from loguru import logger
 from pydantic import BaseModel, model_validator
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -123,8 +124,19 @@ async def _log_tool_call(
             customer_intent=(customer_intent or call_purpose or "")[:64],
         )
         db.add(call)
-        await db.flush()
-        return call
+        try:
+            await db.flush()
+        except IntegrityError:
+            # Lost the race with a concurrent tool call for the same call —
+            # merge into the winner's row below instead of 500ing.
+            await db.rollback()
+            call = (
+                await db.execute(select(Call).where(Call.call_id == call_id))
+            ).scalar_one_or_none()
+            if call is None:
+                raise
+        else:
+            return call
     # update existing row with anything new the tool call carried
     if call_type and not call.call_type:
         call.call_type = call_type

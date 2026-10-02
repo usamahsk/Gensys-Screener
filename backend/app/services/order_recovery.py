@@ -190,16 +190,159 @@ def _redact_key(msg: str) -> str:
     return redact(msg)
 
 
-MENU = """PIZZAS (Small / Medium / Large) — crust Regular or Thin at no extra charge:
-- Margherita Pizza (Veg): 8.99 / 11.99 / 14.99
-- Pepperoni Pizza (Non-Veg): 9.99 / 12.99 / 15.99
-- BBQ Chicken Pizza (Non-Veg): 10.99 / 13.99 / 16.99
-- Veggie Supreme Pizza (Veg): 9.99 / 12.99 / 15.99
-- Meat Lovers Pizza (Non-Veg): 11.99 / 14.99 / 17.99
-- Four Cheese Pizza (Veg): 10.99 / 13.99 / 16.99
-SIDES: Garlic Bread 4.99, Garlic Bread with Cheese 5.99, Chicken Wings (6 piece) 6.99, French Fries 3.49
-DRINKS: Soft Drink can (Coke/Sprite) 1.99, Soft Drink 1.5 litre bottle 3.49, Bottled Water 1.49
-DESSERTS: Chocolate Brownie 4.49, Choco Lava Cake 4.99"""
+MENU = """MENU (hardcoded — never invent an item, size, or price not listed here)
+PIZZAS (Small / Medium / Large):
+1. Margherita Pizza (Veg) — mozzarella, tomato sauce, basil — $8.99 / $11.99 / $14.99
+2. Pepperoni Pizza (Non-Veg) — pepperoni, mozzarella, tomato sauce — $9.99 / $12.99 / $15.99
+3. BBQ Chicken Pizza (Non-Veg) — grilled chicken, BBQ sauce, red onion, mozzarella — $10.99 / $13.99 / $16.99
+4. Veggie Supreme Pizza (Veg) — bell pepper, onion, mushroom, olives, sweetcorn — $9.99 / $12.99 / $15.99
+5. Meat Lovers Pizza (Non-Veg) — pepperoni, sausage, bacon, ham — $11.99 / $14.99 / $17.99
+6. Four Cheese Pizza (Veg) — mozzarella, cheddar, parmesan, gorgonzola — $10.99 / $13.99 / $16.99
+Crust: Regular or Thin, available on any pizza at no extra charge.
+
+SIDES:
+- Garlic Bread — $4.99
+- Garlic Bread with Cheese — $5.99
+- Chicken Wings (6 piece) — $6.99
+- French Fries — $3.49
+
+DRINKS:
+- Soft Drink can (Coke / Sprite) — $1.99
+- Soft Drink 1.5 litre bottle — $3.49
+- Bottled Water — $1.49
+
+DESSERTS:
+- Chocolate Brownie — $4.49
+- Choco Lava Cake — $4.99
+
+Name aliases customers use: "Veg Supreme" / "Veggie Supreme" = Veggie Supreme Pizza; "Fries" = French Fries; "Coke" / "Sprite" / "Soft Drink" (can-sized) = Soft Drink can; "1.5 litre bottle" / "family bottle" = Soft Drink 1.5 litre bottle; "Brownie" = Chocolate Brownie; "Lava Cake" = Choco Lava Cake; "Wings" = Chicken Wings (6 piece). "Thin" / "Regular" alone refer to crust (free) — never a price; put crust in notes, size stays Small/Medium/Large."""
+
+# Server-side price table mirroring MENU above: normalized name → {size → price}.
+# Flat-price items use the "" size key. Applied to any zero-price item AFTER
+# Gemini, so a missing price is filled even when the LLM leaves 0.
+_MENU_PRICES: dict[str, dict[str, float]] = {
+    "margherita pizza": {"small": 8.99, "medium": 11.99, "large": 14.99},
+    "pepperoni pizza": {"small": 9.99, "medium": 12.99, "large": 15.99},
+    "bbq chicken pizza": {"small": 10.99, "medium": 13.99, "large": 16.99},
+    "veggie supreme pizza": {"small": 9.99, "medium": 12.99, "large": 15.99},
+    "meat lovers pizza": {"small": 11.99, "medium": 14.99, "large": 17.99},
+    "four cheese pizza": {"small": 10.99, "medium": 13.99, "large": 16.99},
+    "garlic bread": {"": 4.99},
+    "garlic bread with cheese": {"": 5.99},
+    "chicken wings": {"": 6.99},
+    "french fries": {"": 3.49},
+    "soft drink can": {"": 1.99},
+    "soft drink bottle": {"": 3.49},
+    "bottled water": {"": 1.49},
+    "chocolate brownie": {"": 4.49},
+    "choco lava cake": {"": 4.99},
+}
+
+# Customer phrasings → canonical menu names.
+_MENU_ALIASES = {
+    "margherita": "margherita pizza",
+    "pepperoni": "pepperoni pizza",
+    "bbq chicken": "bbq chicken pizza",
+    "veg supreme": "veggie supreme pizza",
+    "veg supreme pizza": "veggie supreme pizza",
+    "veggie supreme": "veggie supreme pizza",
+    "supreme pizza": "veggie supreme pizza",
+    "supreme": "veggie supreme pizza",
+    "meat lovers": "meat lovers pizza",
+    "meat lover": "meat lovers pizza",
+    "four cheese": "four cheese pizza",
+    "4 cheese": "four cheese pizza",
+    "garlic bread with cheese": "garlic bread with cheese",
+    "cheese garlic bread": "garlic bread with cheese",
+    "garlic bread": "garlic bread",
+    "chicken wings": "chicken wings",
+    "wings": "chicken wings",
+    "french fries": "french fries",
+    "fries": "french fries",
+    "soft drink can": "soft drink can",
+    "coke": "soft drink can",
+    "sprite": "soft drink can",
+    "soft drink": "soft drink can",
+    "soda": "soft drink can",
+    "1.5 litre bottle": "soft drink bottle",
+    "1.5 liter bottle": "soft drink bottle",
+    "family bottle": "soft drink bottle",
+    "soft drink bottle": "soft drink bottle",
+    "bottled water": "bottled water",
+    "water": "bottled water",
+    "chocolate brownie": "chocolate brownie",
+    "brownie": "chocolate brownie",
+    "choco lava cake": "choco lava cake",
+    "lava cake": "choco lava cake",
+}
+
+_CRUST_WORDS = {"thin", "regular", "thin crust", "regular crust"}
+
+_MENU_DISPLAY = {
+    "margherita pizza": "Margherita Pizza",
+    "pepperoni pizza": "Pepperoni Pizza",
+    "bbq chicken pizza": "BBQ Chicken Pizza",
+    "veggie supreme pizza": "Veggie Supreme Pizza",
+    "meat lovers pizza": "Meat Lovers Pizza",
+    "four cheese pizza": "Four Cheese Pizza",
+    "garlic bread": "Garlic Bread",
+    "garlic bread with cheese": "Garlic Bread with Cheese",
+    "chicken wings": "Chicken Wings (6 piece)",
+    "french fries": "French Fries",
+    "soft drink can": "Soft Drink can",
+    "soft drink bottle": "Soft Drink 1.5 litre bottle",
+    "bottled water": "Bottled Water",
+    "chocolate brownie": "Chocolate Brownie",
+    "choco lava cake": "Choco Lava Cake",
+}
+
+
+def _lookup_menu_price(name: str, size: str) -> tuple[float, str, str]:
+    """(price, canonical_name, size) from MENU; (0, name, size) when no match.
+
+    Crust words (thin/regular) are not sizes — they fall back to Medium
+    pricing and the crust is appended to notes by the caller.
+    """
+    raw = (name or "").strip()
+    norm = raw.lower().strip()
+    # strip diet tags customers parrot back ("Margherita (Veg)", "Non-Veg")
+    norm = re.sub(r"\(.*?\)", "", norm)
+    norm = re.sub(r"\bnon\s?-?\s?veg\b", "", norm)
+    norm = re.sub(r"\bveg\b", "", norm)
+    # strip crust phrases (priced by size, crust is free)
+    norm = re.sub(r"\b(thin|regular)\s+crust\b", "", norm)
+    norm = re.sub(r"\bcrust\b", "", norm)
+    # strip a leading quantity word ("one large veg supreme", "2x coke")
+    norm = re.sub(r"^(one|two|three|four|five|six|seven|eight|nine|ten|\d+\s?x?)\b", "", norm)
+    norm = re.sub(r"[^a-z0-9 .]", "", norm).strip()
+    norm = re.sub(r"\s+", " ", norm)
+    size_key = (size or "").strip().lower()
+    if not size_key:
+        # size baked into the name ("Pepperoni Pizza Large")
+        m = re.search(r"\b(small|medium|large)\b", norm)
+        if m:
+            size_key = m.group(1)
+            norm = re.sub(r"\b(small|medium|large)\b", "", norm).strip()
+            norm = re.sub(r"\s+", " ", norm)
+    key = _MENU_ALIASES.get(norm, norm)
+    if key in _MENU_ALIASES:
+        key = _MENU_ALIASES[key]
+    if "pizza" not in key and f"{key} pizza" in _MENU_PRICES:
+        key = f"{key} pizza"
+    table = _MENU_PRICES.get(key)
+    if table is None:
+        # last resort: substring match ("large veg supreme" etc.)
+        for cand, t in _MENU_PRICES.items():
+            if cand and cand in norm:
+                table, key = t, cand
+                break
+    if table is None:
+        return 0.0, raw, size or ""
+    if "" in table:
+        return table[""], key, ""
+    if size_key in _CRUST_WORDS or not size_key:
+        return table["medium"], key, size or ""
+    return table.get(size_key, table["medium"]), key, size or ""
 
 _PROMPT = """You extract a restaurant order from a phone-call transcript.
 First classify the call purpose as one of:
@@ -222,14 +365,14 @@ Order JSON (ONLY valid JSON, no markdown, no explanation) with exactly these key
   "customer_name": "full name as heard, else empty string — do NOT guess",
   "customer_phone": "digits only, include + and country code if heard, else empty string",
   "order_type": "takeaway or dinein ONLY - delivery, pickup, takeaway and takeout all mean takeaway; use dinein only for eat-in/table service",
-  "items": [{"name": "dish as heard", "quantity": number, "unit_price": number, "size": "Small/Medium/Large/Regular/Thin if mentioned else empty"}],
+  "items": [{"name": "dish as heard (use the exact MENU name when it matches an alias)", "quantity": number, "unit_price": number, "size": "Small/Medium/Large if mentioned else empty", "notes": "crust (Thin/Regular) and extras if mentioned else empty"}],
   "total": total number or 0,
   "delivery_address": "if mentioned else empty string",
   "payment_method": "cash/UPI/card if mentioned else empty string",
   "email": "if mentioned else empty string (optional — never block an order on it)",
   "missing_fields": ["subset of: customer_name, customer_phone, items, order_number, confirmation, payment_method, delivery_address, order_type"]
 }
-Prices (all in dollars): if the call quotes a price, use it. If the price is missing, look it up in the MENU below and fill it in — a missing price must never block the order. Pizzas with no size heard default to Medium. Only items with no menu match stay 0. "total" must equal the sum of quantity × unit_price.
+Prices (all in dollars): if the call quotes a price, use it. If the price is missing, look it up in the MENU below and fill it in — a missing price must never block the order. Pizzas with no size heard default to Medium. "Thin"/"Regular" alone mean crust (free) — put crust in notes, never in size, and price by Small/Medium/Large (Medium when unheard). Only items with no menu match stay 0. "total" must equal the sum of quantity × unit_price.
 MENU:
 """ + MENU + """
 Rules: quantities default to 1. Do NOT add any delivery fee yourself — it is computed afterwards.
@@ -243,15 +386,34 @@ def _finalize_items(req, delivery_address: str) -> tuple[list[dict], float, bool
     """Items + total with server-side delivery fee.
 
     Subtotal comes from per-item prices (or the LLM total as fallback).
-    A $2.50 delivery-fee line is appended when a delivery address exists and
-    the subtotal is below $25. Returns (items, total, fee_applied).
+    Any zero-price item is priced from the hardcoded MENU first, so the
+    total is correct even when Gemini leaves unit_price at 0. A $2.50
+    delivery-fee line is appended when a delivery address exists and the
+    subtotal is below $25. Returns (items, total, fee_applied).
     """
-    items = [{
-        "sku": (it.sku or "")[:128].strip(),
-        "name": (it.name or it.sku or "Item")[:128].strip(),
-        "quantity": it.quantity, "unit_price": float(it.unit_price or 0),
-        "size": (it.size or "")[:32], "notes": (it.notes or "")[:256],
-    } for it in req.items]
+    items = []
+    for it in req.items:
+        price = float(it.unit_price or 0)
+        name = (it.name or it.sku or "Item").strip()
+        size = (it.size or "").strip()
+        notes = (it.notes or "").strip()
+        if price <= 0:
+            menu_price, canon, menu_size = _lookup_menu_price(name, size)
+            if menu_price > 0:
+                price = menu_price
+                name = _MENU_DISPLAY.get(canon, canon)
+                # keep a heard crust word visible in notes
+                if size and size.lower() in _CRUST_WORDS and "crust" not in notes.lower():
+                    notes = f"{notes}; {size} crust".strip("; ")
+                size = menu_size
+                logger.info(f"order_recovery: menu-priced '{name}' "
+                            f"({size or 'standard'}) at {price}")
+        items.append({
+            "sku": (it.sku or "")[:128].strip(),
+            "name": name[:128],
+            "quantity": it.quantity, "unit_price": price,
+            "size": size[:32], "notes": notes[:256],
+        })
     subtotal = sum(i["unit_price"] * i["quantity"] for i in items)
     priced = any(i["unit_price"] > 0 for i in items)
     if not priced and req.total:
@@ -447,8 +609,10 @@ async def analyze_transcript(text: str, api_key: str, model: str) -> dict:
     from app.schemas import OrderCreateRequest as _OCR
     data = await _ask_gemini(text, api_key, model or "gemini-3.5-flash")
     if not data:
-        return {"req": None, "purpose": "general", "missing": [],
-                "no_order": True, "reason": "no json"}
+        # LLM call failed (quota/5xx/invalid JSON) — unknown stays unknown:
+        # callers must NOT tag the call "general" off a failed lookup.
+        return {"req": None, "purpose": "", "missing": [],
+                "no_order": True, "reason": "llm_error"}
     purpose = _normalize_purpose(data.get("call_purpose"), data, text)
     if data.get("no_order"):
         if data.get("reason"):

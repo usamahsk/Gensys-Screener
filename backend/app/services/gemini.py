@@ -15,6 +15,8 @@ API keys are redacted from every log line this module emits.
 import re
 import time
 
+import asyncio
+
 import httpx
 from loguru import logger
 
@@ -80,19 +82,49 @@ async def generate_content(
     contents: list[dict],
     generation_config: dict | None = None,
     timeout: int = 60,
+    retries: int = 3,
 ) -> str:
-    """POST generateContent with header auth + resolved model. Returns text."""
+    """POST generateContent with header auth + resolved model. Returns text.
+
+    Retries 429/5xx with exponential backoff (honoring Retry-After) — a
+    burst of post-call webhooks shares one quota, so a single 429 must not
+    kill order extraction or the call summary.
+    """
     m = await resolve_model(api_key, model)
     body: dict = {"contents": contents}
     if generation_config:
         body["generationConfig"] = generation_config
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(
-            f"{BASE}/models/{m}:generateContent",
-            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-            json=body,
-        )
-        r.raise_for_status()
-        data = r.json()
-    parts = data["candidates"][0]["content"]["parts"]
-    return " ".join(p.get("text", "") for p in parts).strip()
+    delay = 2.0
+    last_exc: Exception | None = None
+    for attempt in range(max(1, retries)):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.post(
+                    f"{BASE}/models/{m}:generateContent",
+                    headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+                    json=body,
+                )
+                r.raise_for_status()
+                data = r.json()
+            parts = data["candidates"][0]["content"]["parts"]
+            return " ".join(p.get("text", "") for p in parts).strip()
+        except httpx.HTTPStatusError as e:
+            last_exc = e
+            status = e.response.status_code if e.response is not None else 0
+            if status != 429 and not 500 <= status <= 599:
+                raise
+            if attempt >= max(1, retries) - 1:
+                raise
+            retry_after = 0.0
+            try:
+                retry_after = float(e.response.headers.get("Retry-After", "0") or 0)
+            except (ValueError, TypeError, AttributeError):
+                retry_after = 0.0
+            wait = max(retry_after, delay)
+            logger.warning(
+                f"gemini: {status} on {m} (attempt {attempt + 1}/{max(1, retries)}), "
+                f"retrying in {wait:.1f}s")
+            await asyncio.sleep(wait)
+            delay *= 2
+    assert last_exc is not None
+    raise last_exc

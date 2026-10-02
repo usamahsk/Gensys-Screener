@@ -16,6 +16,7 @@ from typing import Any
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request
 from loguru import logger
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -276,7 +277,15 @@ async def call_ended(
             logger.warning(f"call {call_id!r}: extraction failed ({e})")
             order = None
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # Lost the race with a concurrent duplicate webhook (Dograh retries
+        # while the first request is still in Gemini extraction) — the
+        # winner's rows stand, this one is a duplicate.
+        await db.rollback()
+        logger.warning(f"call {call_id!r}: concurrent webhook insert, treating as duplicate")
+        return {"status": "duplicate", "call_id": call_id}
     # Background pass only when no order exists yet — it creates the order on
     # success and saves nothing on failure.
     if order is None and call_id and call_id != "unknown":
@@ -518,26 +527,7 @@ async def transfer(payload: TransferWebhook, db: AsyncSession = Depends(get_db))
         await db.execute(select(Call).where(Call.call_id == call_id))
     ).scalar_one_or_none()
 
-    if call:
-        call.disposition = "transferred"
-        if reason:
-            call.escalation_reason = reason
-        if customer_name and not (call.customer_name or "").strip():
-            call.customer_name = customer_name
-        if customer_phone and not (call.customer_phone or "").strip():
-            call.customer_phone = customer_phone
-        if not (call.summary or "").strip():
-            # No summary yet (transfer arrived before call end) — write a
-            # handoff line now so Agent View has something; call-ended
-            # replaces it with the full conversation summary later.
-            call.summary = (
-                f"Transferred to agent: {reason}. "
-                f"Customer {customer_name or customer_phone or 'unknown'} — "
-                "full conversation summary arrives when the call ends."
-                if reason else
-                "Transferred to a human agent. Full conversation summary arrives when the call ends."
-            )
-    else:
+    if call is None:
         call = Call(
             call_id=call_id,
             disposition="transferred",
@@ -549,17 +539,39 @@ async def transfer(payload: TransferWebhook, db: AsyncSession = Depends(get_db))
             transcript=[],
             tool_calls=[],
             order_numbers=[],
-            summary=(
-                f"Transferred to agent: {reason}. "
-                f"Customer {customer_name or customer_phone or 'unknown'} — "
-                "full conversation summary arrives when the call ends."
-                if reason else
-                "Transferred to a human agent. Full conversation summary arrives when the call ends."
-            ),
             escalation_reason=reason,
         )
         db.add(call)
-        await db.flush()
+        try:
+            await db.flush()
+        except IntegrityError:
+            # Lost the race with a concurrent call-ended webhook that just
+            # created this row — fall through to the update path below.
+            await db.rollback()
+            call = (
+                await db.execute(select(Call).where(Call.call_id == call_id))
+            ).scalar_one_or_none()
+            if call is None:
+                raise HTTPException(500, "Could not record transfer, please retry")
+
+    # Common update path (pre-existing, just-created, or race-reloaded row).
+    call.disposition = "transferred"
+    if reason:
+        call.escalation_reason = reason
+    if customer_name and not (call.customer_name or "").strip():
+        call.customer_name = customer_name
+    if customer_phone and not (call.customer_phone or "").strip():
+        call.customer_phone = customer_phone
+    if not (call.summary or "").strip():
+        # No summary yet (transfer arrived before call end) — write a
+        # short handoff line so Agent View has something; call-ended
+        # replaces it with the full conversation summary later.
+        call.summary = (
+            f"Transferred to agent: {reason}. "
+            f"Customer {customer_name or customer_phone or 'unknown'}."
+            if reason else
+            "Transferred to a human agent."
+        )
 
     agent_context: dict[str, Any] = {"reason_for_transfer": reason}
     transcript = call.transcript or []
