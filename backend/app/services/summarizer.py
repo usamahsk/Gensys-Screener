@@ -106,6 +106,30 @@ def _first_customer_turn(transcript: list[dict]) -> str:
     return ""
 
 
+def _clean_snippet(s: str, max_len: int = 180) -> str:
+    """One-line snippet without transcript timestamp markers."""
+    import re as _re
+
+    one_line = _re.sub(r"\[\d{4}-\d{2}-\d{2}T[^\]]*\]\s*", "", s or "")
+    one_line = " ".join(one_line.split()).strip()
+    if len(one_line) > max_len:
+        return one_line[: max_len - 1].rstrip() + "…"
+    return one_line
+
+
+def _last_turn(transcript: list[dict], customer_side: bool) -> str:
+    """Last caller-side (or agent-side) turn text, timestamp markers stripped."""
+    roles = _CUSTOMER_ROLES if customer_side else _AGENT_ROLES
+    for t in reversed(transcript or []):
+        if not isinstance(t, dict):
+            continue
+        if str(t.get("role", "")).strip().lower() in roles:
+            c = _clean_snippet(_turn_text(t))
+            if c and c != "(no transcript)":
+                return c
+    return ""
+
+
 def _intent_from_tools(tool_calls: list[dict]) -> str:
     """Intent hint from tool activity when the transcript has no caller turn."""
     names = " ".join(str(tc.get("name", "")) for tc in (tool_calls or [])).lower()
@@ -134,20 +158,44 @@ _PURPOSE_INTENT = {
 
 def _extractive(transcript: list[dict], tool_calls: list[dict], disposition: str,
                 purpose: str = "") -> str:
-    first_customer = _first_customer_turn(transcript)
-    intent = first_customer[:160] + ("…" if len(first_customer) > 160 else "")
+    """Offline 3–4 sentence continue-brief (no LLM): want → did → stands → next.
+
+    Never returns a bare "Call completed successfully." — even a 2-turn call
+    yields what the customer said, what the agent said/did, and where to
+    continue, so Agent View always has something to brief on.
+    """
+    first_customer = _clean_snippet(_first_customer_turn(transcript))
+    intent = first_customer
     if not intent:
         intent = _intent_from_tools(tool_calls)
     if not intent and (purpose or "").strip().lower() in _PURPOSE_INTENT:
         intent = _PURPOSE_INTENT[(purpose or "").strip().lower()]
-    actions = [tc.get("name", "?") for tc in tool_calls]
-    action_part = f"Actions taken: {', '.join(actions)}." if actions else ""
-    outcome = {
-        "transferred": "Call was transferred to a human agent.",
-        "failed": "Call ended in error.",
-        "abandoned": "Customer hung up before completion.",
-    }.get(disposition, "Call completed successfully.")
+    actions = [tc.get("name", "?") for tc in (tool_calls or []) if isinstance(tc, dict)]
+    last_customer = _last_turn(transcript, customer_side=True)
+    last_agent = _last_turn(transcript, customer_side=False)
+
+    sentences: list[str] = []
     if intent:
-        return f"Customer intent: {intent}.{(' ' + action_part) if action_part else ''} {outcome}"
-    # No intent evidence — never print "not captured", just state actions + outcome.
-    return f"{action_part} {outcome}".strip()
+        sentences.append(f'The customer called to {intent.rstrip(".")}.'
+                         if not intent.startswith("The customer")
+                         and len(intent.split()) < 12
+                         else f'Customer said: "{intent}".')
+    elif last_customer:
+        sentences.append(f'Customer said: "{last_customer}".')
+    if actions:
+        sentences.append(f"The voice agent already ran: {', '.join(actions)}.")
+    elif last_agent and last_agent != (sentences[0] if sentences else None):
+        sentences.append(f'The agent replied: "{last_agent}".')
+    if last_customer and last_customer not in (intent or ""):
+        sentences.append(f'Latest from the customer: "{last_customer}".')
+    elif last_agent and len(sentences) < 3:
+        pass  # agent line already captured above
+    outcome = {
+        "transferred": "The call was handed to a human agent — continue from the last message.",
+        "failed": "The call ended in error — check the transcript tail before calling back.",
+        "abandoned": "The customer hung up — follow up from the last message.",
+    }.get((disposition or "").strip().lower(),
+          "Continue from the last message so the caller does not repeat themselves.")
+    sentences.append(outcome)
+    brief = " ".join(s for s in sentences if s).strip()
+    return brief[:900] or "Continue from the transcript below."

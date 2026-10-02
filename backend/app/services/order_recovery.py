@@ -43,20 +43,27 @@ def _gen_order_number() -> str:
 
 
 def _valid_order_number(raw: object) -> str:
-    """Accept only real PB-style codes (PB- + 3-10 phone-safe chars).
+    """Accept only real PB-style codes.
 
+    Two shapes pass: sequential numeric codes (PB-105 — what the agent
+    reads out from next-number) and 3–10 phone-safe chars (PB-A1B).
     The voice agent sometimes hallucinates a number ("P-B two four") when a
-    tool call returns empty — that must never become a stored order number.
-    Normalizes separators/case ("pb a1b" → "PB-A1B"); anything else → "".
+    tool call returns empty — word-codes fail the alphabet check and are
+    rejected, so that must never become a stored order number. Normalizes
+    separators/case ("pb 105" → "PB-105"); anything else → "".
     """
     if not raw or not isinstance(raw, str):
         return ""
-    s = raw.strip().upper().replace(" ", "").replace("_", "")
-    m = re.fullmatch(r"P-?B-?([A-Z0-9]{3,10})", s)
+    # Strip every separator first: the agent reads digit-by-digit
+    # ("P-B-1-0-5"), customers say "PB 105" — all normalize to PB105.
+    s = re.sub(r"[\s\-_]", "", raw.strip().upper())
+    m = re.fullmatch(r"PB([A-Z0-9]{1,10})", s)
     if not m:
         return ""
     code = m.group(1)
-    if any(ch not in _ORDER_CODE_SET for ch in code):
+    if code.isdigit():
+        return f"PB-{code}"
+    if len(code) < 3 or any(ch not in _ORDER_CODE_SET for ch in code):
         return ""
     return f"PB-{code}"
 
@@ -90,10 +97,19 @@ def _extract_order_number_from_text(text: str) -> str:
     """
     if not text:
         return ""
-    # Code immediately after the PB prefix (separators tolerated). The group
-    # itself has no spaces so trailing words ("PB-A1B confirmed") can't
-    # poison the match; _valid_order_number rejects non-alphabet codes.
-    for m in re.finditer(r"\bP\s?-?\s?B\s?-?\s?([A-Z0-9]{3,10})\b", text, re.IGNORECASE):
+    # Digit runs first ("P-B-1-0-5", "PB 105"): separators between digits
+    # belong to the code, so "PB-1" partials can never match.
+    for m in re.finditer(
+        r"\bP\s?-?\s?B\s?-?\s?(\d(?:\s?-?\s?\d){0,9})\b", text, re.IGNORECASE
+    ):
+        cand = _valid_order_number("PB-" + m.group(1))
+        if cand:
+            return cand
+    # Letter codes ("PB-A1B"): contiguous, so trailing words
+    # ("PB-A1B confirmed") can't poison the match.
+    for m in re.finditer(
+        r"\bP\s?-?\s?B\s?-?\s?([A-Z0-9]{3,10})\b", text, re.IGNORECASE
+    ):
         cand = _valid_order_number("PB-" + m.group(1))
         if cand:
             return cand
@@ -361,7 +377,7 @@ Order JSON (ONLY valid JSON, no markdown, no explanation) with exactly these key
 {
   "call_purpose": "order_creation",
   "order_confirmed": true,
-  "order_number": "order ID / order number as spoken in the call (e.g. PB-ABC, PB441, ORD-123). Copy it EXACTLY as heard, else empty string — do NOT invent one",
+  "order_number": "order ID as spoken in the call (PB- plus digits the agent read out, e.g. PB-105). Copy it EXACTLY as heard, else empty string — do NOT invent one",
   "customer_name": "full name as heard, else empty string — do NOT guess",
   "customer_phone": "digits only, include + and country code if heard, else empty string",
   "order_type": "takeaway or dinein ONLY - delivery, pickup, takeaway and takeout all mean takeaway; use dinein only for eat-in/table service",
@@ -653,14 +669,28 @@ async def extract_request_from_text(text: str, api_key: str, model: str):
     return result["req"]
 
 
-async def _unique_generated_number(db) -> str:
-    for _ in range(10):
-        num = _gen_order_number()
+async def _next_sequential_number(db, start: int | None = None) -> str:
+    """First free PB-{n} starting at total orders + 1 (bumping past gaps).
+
+    Shared by recovery builds and the next-number endpoint so the spoken
+    number (fetched at call start) and the stored number agree.
+    """
+    from sqlalchemy import func as _func
+    total = (await db.execute(select(_func.count()).select_from(Order))).scalar_one() or 0
+    candidate = start or ((total or 0) + 1)
+    for _ in range(1000):
+        num = f"PB-{candidate}"
         exists = (await db.execute(
             select(Order.id).where(Order.order_number == num))).scalar_one_or_none()
         if exists is None:
             return num
+        candidate += 1
+    # Practically unreachable — fall back to a random code rather than failing.
     return f"PB-{''.join(secrets.choice(_ORDER_CODE_ALPHABET) for _ in range(6))}"
+
+
+async def _unique_generated_number(db) -> str:
+    return await _next_sequential_number(db)
 
 
 async def build_order_from_req(db, req, missing: list[str], text: str,
@@ -672,20 +702,52 @@ async def build_order_from_req(db, req, missing: list[str], text: str,
     both behave identically. Returns the Order (reusing on duplicate number).
     """
     from app.schemas import clean_str as _clean
+    from sqlalchemy.exc import IntegrityError as _IntegrityError
     items, total, _fee = _finalize_items(req, _clean(req.delivery_address))
     # Never store an agent-hallucinated number ("P-B two four"): only a
     # valid PB-style code is kept, otherwise fall back to transcript text,
     # otherwise a plausible legacy code ONLY if it matches a real order row,
-    # otherwise generate a fresh one.
+    # otherwise the next sequential PB-{n}.
     raw_num = (_clean(req.order_number) or "").strip().upper()
     number = _valid_order_number(raw_num) or _extract_order_number_from_text(text or "")
+    if not number:
+        # Pre-reserved PB-{total+1} from call start (Dograh fetched
+        # GET /api/orders/next-number and stored it in initial_context so the
+        # agent speaks the same code). Keeps transcript == DB when Gemini
+        # missed the spoken number.
+        try:
+            scopes = [getattr(call, "initial_context", None) or {},
+                      getattr(call, "gathered_context", None) or {}]
+            for scope in scopes:
+                if not isinstance(scope, dict):
+                    continue
+                for key in ("reserved_order_number", "next_order_number",
+                            "order_number", "pb_number"):
+                    cand = _valid_order_number(scope.get(key))
+                    if cand:
+                        number = cand
+                        break
+                if number:
+                    break
+        except Exception:
+            pass
+        if number:
+            from sqlalchemy import func as _func
+            taken = (await db.execute(
+                select(Order.id).where(_func.upper(Order.order_number) == number)
+            )).scalar_one_or_none()
+            if taken is not None:
+                number = ""  # taken by another call → fresh sequential below
     if not number and _plausible_order_number(raw_num):
         from sqlalchemy import func as _func
         dup = (await db.execute(
-            select(Order.id).where(_func.upper(Order.order_number) == raw_num)
+            select(Order).where(_func.upper(Order.order_number) == raw_num)
         )).scalar_one_or_none()
-        if dup is not None:
-            number = raw_num
+        # Reuse only same-call / unlinked shells — a number owned by ANOTHER
+        # call means two calls raced on one fetched code; fall through to a
+        # fresh sequential number instead of writing into the wrong order.
+        if dup is not None and (dup.call_id or "") in ("", call_id):
+            return dup
     missing = list(missing or [])
     phone = (req.customer_phone or "").strip() or customer_phone or _extract_phone_from_text(text or "")
     name = (req.customer_name or "").strip() or customer_name
@@ -693,15 +755,16 @@ async def build_order_from_req(db, req, missing: list[str], text: str,
         missing = [m for m in missing if m != "customer_phone"]
     if "customer_name" in missing and name:
         missing = [m for m in missing if m != "customer_name"]
+    if number and "order_number" in missing:
+        # Resolved from transcript/contexts after the LLM left it empty
+        # (e.g. pre-reserved PB-{n} from initial_context) — not actually
+        # missing, so it must not force `incomplete`.
+        missing = [m for m in missing if m != "order_number"]
     if not number:
-        number = await _unique_generated_number(db)
+        number = await _next_sequential_number(db)
         if "order_number" not in missing:
             missing.append("order_number")
     status = INCOMPLETE_STATUS if missing else "confirmed"
-    existing = (await db.execute(
-        select(Order).where(Order.order_number == number))).scalar_one_or_none()
-    if existing is not None:
-        return existing
     order = Order(
         order_number=number, customer_name=name, customer_phone=phone,
         email=_clean(req.email), order_type=req.order_type,
@@ -712,7 +775,18 @@ async def build_order_from_req(db, req, missing: list[str], text: str,
         source="transcript_recovery", call_id=call_id,
     )
     db.add(order)
-    await db.flush()
+    try:
+        # Savepoint: a concurrent call racing on the same sequential code
+        # rolls back only this insert, then we retry with the next number —
+        # the outer transaction (call row, memory) stays intact.
+        async with db.begin_nested():
+            await db.flush()
+    except _IntegrityError:
+        number = await _next_sequential_number(db)
+        order.order_number = number
+        async with db.begin_nested():
+            await db.flush()
+        logger.info(f"order_recovery: sequential collision, stored as {number} for call {call_id!r}")
     for it in items:
         db.add(OrderItem(
             order_id=order.id, menu_item_id=None,

@@ -18,14 +18,53 @@ VALID_STATUSES = {"confirmed", "preparing", "ready", "in_transit", "completed", 
 
 @router.get("/next-number")
 async def next_order_number(db: AsyncSession = Depends(get_db)):
-    """Total order count + the next sequential number (total + 1).
+    """Total order count + the next sequential order code (first free PB-{n}).
 
-    The voice workflow calls this before creating an order so order numbers
-    stay sequential: next_order_number = total_orders + 1. (Must be declared
-    before /{order_number} or FastAPI would treat "next-number" as an id.)
+    The voice workflow calls this at call start and the agent speaks the
+    code (digit by digit) so the transcript number and the stored order
+    number agree. (Must be declared before /{order_number} or FastAPI would
+    treat "next-number" as an id.)
     """
+    return await _next_number_payload(db)
+
+
+class NextNumberPrefetchRequest(BaseModel):
+    """Body for POST /next-number — everything optional so Dograh can POST
+    `{}` (or nothing) from a prefetch / workflow-start HTTP node."""
+
+    model_config = {"extra": "ignore"}
+
+    call_id: str = ""
+    workflow_run_id: str = ""
+
+
+@router.post("/next-number")
+async def reserve_order_number(
+    body: Optional[NextNumberPrefetchRequest] = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """POST variant of next-number for Dograh prefetch / initial-context nodes.
+
+    Some Dograh HTTP nodes only support POST. Call this at workflow start
+    (body `{}` is fine), then map the response into the run context, e.g.
+    `reserved_order_number <= response.reserved_order_number`, and have the
+    agent speak `PB-{{reserved_order_number}}`. The webhook extraction
+    reuses the same code, so transcript == stored order.
+    """
+    return await _next_number_payload(db)
+
+
+async def _next_number_payload(db: AsyncSession) -> dict:
+    from app.services.order_recovery import _next_sequential_number
+
     total = (await db.execute(select(func.count()).select_from(Order))).scalar_one()
-    return {"total_orders": total, "next_order_number": total + 1}
+    code = await _next_sequential_number(db, start=(total or 0) + 1)
+    n = int(code.split("-")[1])
+    return {"total_orders": total, "next_order_number": n,
+            "next_order_code": code, "order_number": code,
+            "reserved_order_number": code,
+            "initial_context": {"reserved_order_number": code,
+                                "next_order_number": n, "order_number": code}}
 
 
 class StatusUpdateRequest(BaseModel):

@@ -19,6 +19,64 @@ import { FileText, Headset, RefreshCw, ShoppingCart, User, Volume2 } from "lucid
  * (POST /api/webhooks/call-ended with disposition=transfer*, or
  * POST /api/webhooks/transfer) lands here with disposition=transferred.
  */
+
+const AGENT_ROLES = new Set(["assistant", "agent", "bot", "ai", "system"]);
+
+// Stored summaries that carry no conversation detail — the continue-brief is
+// built from the transcript tail instead of showing these.
+const GENERIC_SUMMARIES = new Set([
+  "call completed successfully.",
+  "call was transferred to a human agent.",
+  "call ended in error.",
+  "customer hung up before completion.",
+  "summary arrives when the call ends.",
+]);
+
+function cleanSnippet(s: string, max = 200): string {
+  const oneLine = (s || "").replace(/\s+/g, " ").trim();
+  return oneLine.length > max ? oneLine.slice(0, max - 1).trimEnd() + "…" : oneLine;
+}
+
+function buildContinueBrief(
+  summary: string,
+  transcript: { role: string; content: string }[],
+  toolCalls: { name: string; args_summary?: string }[],
+  orderNumbers: string[],
+): string {
+  const s = (summary || "").trim();
+  if (s && !GENERIC_SUMMARIES.has(s.toLowerCase().replace(/\s+/g, " ")) && s.length > 60) {
+    return s;
+  }
+  if (transcript.length === 0) {
+    if (s) return s;
+    return "Summary arrives when the call ends.";
+  }
+  const isAgent = (r: string) => AGENT_ROLES.has((r || "").toLowerCase());
+  const customerTurns = transcript.filter((t) => !isAgent(t.role) && t.content.trim());
+  const agentTurns = transcript.filter((t) => isAgent(t.role) && t.content.trim());
+  const sentences: string[] = [];
+  if (customerTurns[0]) {
+    sentences.push(`The customer called and said: "${cleanSnippet(customerTurns[0].content, 180)}".`);
+  }
+  if (toolCalls.length > 0) {
+    const names = toolCalls.map((t) => t.name).filter(Boolean).join(", ");
+    sentences.push(`The voice agent already ran: ${names}.`);
+  } else if (agentTurns[0]) {
+    sentences.push(`The voice agent responded: "${cleanSnippet(agentTurns[0].content, 180)}".`);
+  }
+  const last = transcript[transcript.length - 1];
+  if (last && transcript.length > 1) {
+    const who = isAgent(last.role) ? "The agent last said" : "The customer last said";
+    sentences.push(`${who}: "${cleanSnippet(last.content, 180)}".`);
+  }
+  const orderBit = orderNumbers.filter(Boolean)[0];
+  if (orderBit) {
+    sentences.push(`Order ${orderBit} is linked — confirm its status before continuing.`);
+  } else {
+    sentences.push("Pick up from the last message so the caller does not repeat themselves.");
+  }
+  return sentences.slice(0, 4).join(" ");
+}
 export default function AgentViewPage() {
   const [transferred, setTransferred] = useState<CallRow[]>([]);
   const [selected, setSelected] = useState<CallRow | null>(null);
@@ -67,9 +125,17 @@ export default function AgentViewPage() {
   }, [selected]);
 
   const summary = detail?.summary || selected?.summary || "";
-  const escalationReason = detail?.escalation_reason || selected?.escalation_reason || "";
   const transcript = normalizeTurns(detail?.transcript || []);
   const toolCalls = detail?.tool_calls || [];
+  const orderNumbers = detail?.order_numbers?.length
+    ? detail.order_numbers
+    : selected?.order_numbers || [];
+
+  // 3–4 sentence continue-brief so the agent gets the conversation at a
+  // glance. Stored summaries win unless they are generic fallbacks
+  // ("Call completed successfully."), which carry no conversation detail —
+  // then the brief is built from the transcript tail instead.
+  const continueBrief = buildContinueBrief(summary, transcript, toolCalls, orderNumbers);
 
   return (
     <div className="space-y-4">
@@ -101,7 +167,7 @@ export default function AgentViewPage() {
                 <DispositionBadge disposition={c.disposition} />
               </div>
               <div className="mt-1 flex items-center justify-between gap-2">
-                <div className="truncate text-xs text-muted-foreground">{c.escalation_reason || c.summary || "Transferred"}</div>
+                <div className="truncate text-xs text-muted-foreground">{c.summary || "Transferred"}</div>
                 <span className="shrink-0 text-xs text-muted-foreground">{fmtDateTime(c.started_at)}</span>
               </div>
             </button>
@@ -115,19 +181,6 @@ export default function AgentViewPage() {
 
         {selected && (
           <div className="space-y-4">
-            <Card className="border-amber-200 bg-amber-50">
-              <CardHeader className="pb-2">
-                <CardTitle className="flex items-center gap-2 text-sm text-amber-800">
-                  <Badge variant="secondary" className="bg-amber-200 text-amber-900 hover:bg-amber-200">
-                    Transfer — reason to continue from
-                  </Badge>
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="text-sm text-amber-900">
-                {escalationReason || "Transferred from the voice agent — see summary below."}
-              </CardContent>
-            </Card>
-
             <Card className="card-clean">
               <CardHeader className="pb-2">
                 <CardTitle className="flex items-center gap-2 text-sm text-[#000E49]">
@@ -137,7 +190,7 @@ export default function AgentViewPage() {
                   Conversation summary — continue the call from here
                 </CardTitle>
               </CardHeader>
-              <CardContent className="text-sm">{summary || "Summary arrives when the call ends."}</CardContent>
+              <CardContent className="text-sm">{continueBrief}</CardContent>
             </Card>
 
             <Card className="card-clean">

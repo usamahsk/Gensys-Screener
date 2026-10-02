@@ -262,14 +262,43 @@ Response: `201` with the stored memory object.
 
 ---
 
-## Next order number (sequential)
+## Next order number (sequential — fetch at call start)
 
-**Method:** `GET`  **URL:** `<BASE>/api/orders/next-number`
+**Method:** `POST` (prefetch-safe) or `GET`  **URL:** `<BASE>/api/orders/next-number`
 
-Response: `{ "total_orders": 1381, "next_order_number": 1382 }`
+Use **POST** from Dograh prefetch / workflow-start HTTP nodes (body `{}` is
+fine — every field is optional). Response:
 
-Call this before `create_order` and use `next_order_number` as the order
-number so numbering stays sequential (total count + 1).
+```json
+{
+  "total_orders": 1381,
+  "next_order_number": 1382,
+  "next_order_code": "PB-1382",
+  "order_number": "PB-1382",
+  "reserved_order_number": "PB-1382",
+  "initial_context": {
+    "reserved_order_number": "PB-1382",
+    "next_order_number": 1382,
+    "order_number": "PB-1382"
+  }
+}
+```
+
+To make the spoken number and the stored order identical:
+
+1. At call start (prefetch), `POST <BASE>/api/orders/next-number` with `{}`,
+   and map `reserved_order_number <= response.reserved_order_number` into the
+   run's initial context.
+2. The agent speaks it digit by digit ("P-B-1-3-8-2") when confirming the
+   order — prompt it as `PB-{{reserved_order_number}}`. Never any other
+   number, never an invented one.
+3. Echo it in the `call-ended` webhook as `"order_number": "PB-1382"` and pass
+   the context through (`"initial_context": "{{initial_context}}"`).
+   Extraction copies the spoken number onto the stored order; if the
+   transcript garbles it, the server falls back to the reserved context value,
+   then to the first free `PB-{n}`.
+   On a rare two-calls-at-once collision the second order auto-bumps to the
+   next free code instead of overwriting.
 
 ## Post-call webhooks (not agent tools — configure in Dograh's post-call/webhook hook, or trigger at call end)
 
@@ -362,10 +391,12 @@ You are Pizza Bay's phone ordering assistant.
 - Greet callers; after getting their phone number, call get_customer_memory and
   use it to greet returning customers by name and continue past conversations.
 - Confirm item, quantity, and type (takeaway/dinein + table no. or pickup time)
-  before calling create_order. Read back the order total and order number.
-  Order numbers look like PB-X7K (PB- plus 3 characters) — read them back
-  letter by letter. If create_order returns an empty order_number (pending),
-  NEVER invent one — ask for the missing details and retry the tool.
+  before confirming the order. The order number was fetched at call start
+  (next_order_code, e.g. PB-1382) — read THAT number back digit by digit
+  ("P-B-1-3-8-2"). Never invent, guess, or read out any other number; if no
+  code was fetched, promise confirmation will follow instead of quoting one.
+  (If you use create_order and it returns an empty order_number, same rule:
+  collect the missing details and retry — never invent one.)
 - For "where is my order" questions, call get_order_status and answer naturally.
 - Requests about refunds, payments, complaints, or policy exceptions always go
   to a human.

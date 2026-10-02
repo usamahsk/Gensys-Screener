@@ -29,7 +29,8 @@ from app.services.embeddings import embed_one
 router = APIRouter(prefix="/api/tools", tags=["agent-tools"])
 
 
-# Order numbers: PB- + 3 phone-safe chars (no I/L/O/0/1 — unambiguous over voice).
+# Order numbers are sequential: PB-{total orders + 1} (first free code).
+# Random codes are only a last-resort fallback that is practically unreachable.
 _ORDER_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 
@@ -38,16 +39,58 @@ def _gen_order_number() -> str:
 
 
 async def _gen_unique_order_number(db: AsyncSession) -> str:
-    """Generate a PB- code not already in use (the 3-char space is small)."""
-    for _ in range(10):
-        num = _gen_order_number()
+    """First free PB-{n} starting at total orders + 1 (bumping past gaps)."""
+    total = (await db.execute(select(func.count()).select_from(Order))).scalar_one() or 0
+    candidate = (total or 0) + 1
+    for _ in range(1000):
+        num = f"PB-{candidate}"
         exists = (
             await db.execute(select(Order.id).where(Order.order_number == num))
         ).scalar_one_or_none()
         if exists is None:
             return num
-    # Practically unreachable — fall back to a longer code rather than failing.
+        candidate += 1
+    # Practically unreachable — fall back to a random code rather than failing.
     return f"PB-{''.join(secrets.choice(_ORDER_CODE_ALPHABET) for _ in range(6))}"
+
+
+def _normalize_requested_number(raw: object) -> str:
+    """Accept a pre-reserved number from the agent (PB-105 / PB-A1B shapes).
+
+    Sequential PB-<digits> (from GET /api/orders/next-number) and legacy
+    3-char phone-safe codes both pass; hallucinations ("P-B two four") fail.
+    """
+    import re as _re
+
+    if not raw or not isinstance(raw, str):
+        return ""
+    s = raw.strip().upper().replace(" ", "").replace("_", "")
+    m = _re.fullmatch(r"P-?B-?([A-Z0-9]{1,10})", s)
+    if not m:
+        return ""
+    code = m.group(1)
+    if code.isdigit():
+        return f"PB-{code}"
+    if len(code) < 3 or any(ch not in set(_ORDER_CODE_ALPHABET) for ch in code):
+        return ""
+    return f"PB-{code}"
+
+
+async def _resolve_order_number(db: AsyncSession, requested: object) -> str:
+    """Use the agent's pre-reserved number when it is valid and still free.
+
+    This is what keeps transcript == DB: Dograh fetches next-number at call
+    start, the agent speaks that PB-{n}, and passes the same value as
+    `order_number` to create_order. Otherwise fall back to fresh PB-{total+1}.
+    """
+    want = _normalize_requested_number(requested)
+    if want:
+        exists = (
+            await db.execute(select(Order.id).where(Order.order_number == want))
+        ).scalar_one_or_none()
+        if exists is None:
+            return want
+    return await _gen_unique_order_number(db)
 
 
 async def _log_tool_call(
@@ -277,7 +320,7 @@ async def create_order(
     if fee_applied:
         total = round(total + DELIVERY_FEE, 2)
 
-    order_number = await _gen_unique_order_number(db)
+    order_number = await _resolve_order_number(db, req.order_number)
     order = Order(
         order_number=order_number,
         customer_name=req.customer_name.strip(),

@@ -129,12 +129,22 @@ async def call_ended(
         if not (existing.first_name or "").strip() and payload.resolved_first_name():
             existing.first_name = payload.resolved_first_name()
             updated_fields.append("first_name")
-        if payload.initial_context and not (existing.initial_context or {}):
-            existing.initial_context = payload.initial_context
-            updated_fields.append("initial_context")
-        if payload.gathered_context and not (existing.gathered_context or {}):
-            existing.gathered_context = payload.gathered_context
-            updated_fields.append("gathered_context")
+        if payload.initial_context:
+            merged = dict(existing.initial_context or {})
+            # Merge (not overwrite): the row may predate the webhook, but the
+            # call-start reserved PB-{n} must survive for extraction.
+            added = {k: v for k, v in payload.initial_context.items() if k not in merged}
+            if added:
+                merged.update(added)
+                existing.initial_context = merged
+                updated_fields.append("initial_context")
+        if payload.gathered_context:
+            merged = dict(existing.gathered_context or {})
+            added = {k: v for k, v in payload.gathered_context.items() if k not in merged}
+            if added:
+                merged.update(added)
+                existing.gathered_context = merged
+                updated_fields.append("gathered_context")
         if incoming_purpose and not (existing.customer_intent or "").strip():
             existing.customer_intent = incoming_purpose[:64]
             updated_fields.append("customer_intent")
@@ -317,7 +327,43 @@ async def _materialize_order(
     already exists (link/call_id backfill); otherwise it returns None and the
     transcript classifier tags the Call purpose instead. Real creations (or
     the classifier's incomplete path) still create the row.
+
+    Webhook-only setups (no live create_order tool): Dograh fetches
+    GET /api/orders/next-number at call start, the agent speaks that
+    PB-{n}, and the same value arrives here as order_number (or inside
+    initial_context as reserved_order_number). It is normalized so
+    "pb 1382" / "PB1382" still store as PB-1382; garbage never gets stored —
+    invalid numbers fall through to transcript extraction instead.
     """
+    from app.services.order_recovery import (
+        _plausible_order_number as _plausible_pb,
+        _valid_order_number as _valid_pb,
+    )
+
+    raw_number = (p.order_number or "").strip()
+    p.order_number = _valid_pb(raw_number)
+    if not p.order_number and _plausible_pb(raw_number):
+        # Legacy non-PB code (e.g. KFC-hex): keep it ONLY when it matches a
+        # real order row (status-check backfill) — never mint garbage rows.
+        legacy = (await db.execute(
+            select(Order.id).where(Order.order_number == raw_number.strip().upper())
+        )).scalar_one_or_none()
+        if legacy is not None:
+            p.order_number = raw_number.strip().upper()
+    if not p.order_number:
+        # Reserved PB-{n} from call start may sit in the run contexts even
+        # when the order_number field itself came back empty.
+        for scope in (p.initial_context or {}, p.gathered_context or {}):
+            if not isinstance(scope, dict):
+                continue
+            for key in ("reserved_order_number", "next_order_number",
+                        "order_number", "pb_number"):
+                cand = _valid_pb(scope.get(key))
+                if cand:
+                    p.order_number = cand
+                    break
+            if p.order_number:
+                break
     if not p.order_number:
         return None
     order = (
@@ -506,8 +552,15 @@ def _infer_transfer_reason(transcript: Any, tool_calls: Any) -> str:
         else:
             c = str(t or "")
         if any(k in c.lower() for k in _TRANSFER_PHRASES):
-            snippet = " ".join(c.split())[:200]
-            return f"Handoff detected in transcript: {snippet}" if snippet else "Handoff detected in transcript"
+            import re as _re
+
+            # Strip "[2026-10-02T..] role:" markers so the reason is a clean
+            # one-liner, not a raw transcript dump.
+            snippet = _re.sub(r"\[\d{4}-\d{2}-\d{2}T[^\]]*\]\s*"
+                              r"(?:assistant|user|customer|bot|agent|ai)\s*:\s*",
+                              "", c, flags=_re.IGNORECASE)
+            snippet = " ".join(snippet.split())[:200]
+            return f"Handoff requested: {snippet}" if snippet else "Handoff requested by caller"
     return ""
 
 
