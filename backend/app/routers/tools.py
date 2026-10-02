@@ -6,7 +6,7 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -69,6 +69,9 @@ async def _log_tool_call(
     provider: str = "",
     provider_call_id: str = "",
     call_purpose: str = "",
+    initial_context: dict | None = None,
+    gathered_context: dict | None = None,
+    customer_intent: str = "",
 ) -> Call | None:
     """Create or update the Call Logs row for this tool call.
 
@@ -115,6 +118,9 @@ async def _log_tool_call(
             summary=tool_summary,
             provider=(provider or "dograh")[:32],
             provider_call_id=(provider_call_id or "")[:128],
+            initial_context=initial_context or {},
+            gathered_context=gathered_context or {},
+            customer_intent=(customer_intent or call_purpose or "")[:64],
         )
         db.add(call)
         await db.flush()
@@ -146,6 +152,18 @@ async def _log_tool_call(
         call.provider_call_id = provider_call_id[:128]
     if provider and not (call.provider and call.provider != "dograh"):
         call.provider = provider[:32]
+    if initial_context:
+        merged = dict(call.initial_context or {})
+        merged.update(initial_context)
+        call.initial_context = merged
+    if gathered_context:
+        merged = dict(call.gathered_context or {})
+        merged.update(gathered_context)
+        call.gathered_context = merged
+    if customer_intent and not (call.customer_intent or "").strip():
+        call.customer_intent = customer_intent[:64]
+    elif call_purpose and not (call.customer_intent or "").strip():
+        call.customer_intent = call_purpose[:64]
     if order_number and order_number not in (call.order_numbers or []):
         call.order_numbers = [*(call.order_numbers or []), order_number]
     if tool_name:
@@ -199,6 +217,9 @@ async def create_order(
             tool_summary="noted (pending transcript extraction)",
             provider=req.resolved_provider(),
             provider_call_id=req.resolved_provider_call_id(),
+            initial_context=req.resolved_initial_context(),
+            gathered_context=req.resolved_gathered_context(),
+            customer_intent=req.resolved_customer_intent() or "order_creation",
         )
         await db.commit()
         return OrderCreatedResponse(
@@ -303,6 +324,9 @@ async def create_order(
             tool_summary=f"{order.order_number}: {item_desc} (${order.total})",
         provider=req.resolved_provider(),
         provider_call_id=req.resolved_provider_call_id(),
+        initial_context=req.resolved_initial_context(),
+        gathered_context=req.resolved_gathered_context(),
+        customer_intent=req.resolved_customer_intent() or "order_placement",
     )
 
     await db.commit()
@@ -326,6 +350,261 @@ async def create_order(
 
 
 # --------------------------------------------------------------- order status
+
+class OrderStatusLookupRequest(BaseModel):
+    """POST body for order-status — Dograh-safe: order_number optional.
+
+    Dograh templates often resolve {{order_number}} to null/empty when the
+    caller hasn't said it yet. This model never 422s on null: every field
+    has a default, stray-space keys + LLM aliases are mapped, and an empty
+    order_number falls back to call_id / phone resolution.
+    """
+
+    model_config = {"extra": "ignore", "populate_by_name": True}
+
+    order_number: Optional[Any] = ""
+    call_id: Optional[Any] = ""
+    workflow_run_id: Optional[Any] = ""
+    customer_phone: Optional[Any] = ""
+    phone: Optional[Any] = ""
+    provider: Optional[Any] = ""
+    provider_call_id: Optional[Any] = ""
+    telephony_id: Optional[Any] = ""
+    telephony_call_id: Optional[Any] = ""
+    call_sid: Optional[Any] = ""
+    first_name: Optional[Any] = ""
+    rsvp: Optional[Any] = ""
+    duration: Optional[Any] = 0
+    duration_seconds: Optional[Any] = 0
+    recording_url: Optional[Any] = ""
+    user_recording_url: Optional[Any] = ""
+    bot_recording_url: Optional[Any] = ""
+    transcript_url: Optional[Any] = ""
+    initial_context: Optional[Any] = None
+    gathered_context: Optional[Any] = None
+    customer_intent: Optional[Any] = ""
+
+    @classmethod
+    def _strip_keys(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        stripped: dict[str, Any] = {}
+        for k, v in data.items():
+            sk = str(k).strip()
+            if sk not in stripped:
+                stripped[sk] = v
+        aliases = {
+            "order number": "order_number",
+            "order id": "order_number",
+            "order_id": "order_number",
+            "ordernumber": "order_number",
+            "ordercode": "order_number",
+            "order code": "order_number",
+            "workflow run id": "call_id",
+            "workflow_run_id": "call_id",
+            "phone number": "customer_phone",
+            "customer phone number": "customer_phone",
+            "phone": "customer_phone",
+            "telephony id": "provider_call_id",
+            "telephony_id": "provider_call_id",
+            "telephony call id": "provider_call_id",
+            "provider call id": "provider_call_id",
+            "provider_call_id": "provider_call_id",
+            "provider id": "provider_call_id",
+            "call sid": "provider_call_id",
+            "first name": "first_name",
+            "user recording url": "user_recording_url",
+            "bot recording url": "bot_recording_url",
+            "transcript url": "transcript_url",
+        }
+        normalized = {str(k).strip().lower().replace("-", " "): v for k, v in stripped.items()}
+        for alias, canonical in aliases.items():
+            if alias in normalized and not stripped.get(canonical):
+                stripped[canonical] = normalized[alias]
+        return stripped
+
+    @model_validator(mode="before")  # type: ignore[misc]
+    @classmethod
+    def _map_aliases(cls, data: Any) -> Any:
+        return cls._strip_keys(data)
+
+    def _s(self, v: Any) -> str:
+        return clean_str(v)
+
+    def resolved_order_number(self) -> str:
+        return self._s(self.order_number)
+
+    def resolved_call_id(self) -> str:
+        return self._s(self.call_id or self.workflow_run_id)
+
+    def resolved_phone(self) -> str:
+        return self._s(self.customer_phone or self.phone)
+
+    def resolved_provider(self) -> str:
+        p = self._s(self.provider).lower() or "dograh"
+        return p[:32]
+
+    def resolved_provider_call_id(self) -> str:
+        for cand in (self.provider_call_id, self.telephony_id,
+                      self.telephony_call_id, self.call_sid):
+            s = self._s(cand)
+            if s:
+                return s[:128]
+        return ""
+
+    def resolved_duration(self) -> int:
+        return _coerce_int(self.duration_seconds or self.duration)
+
+    def resolved_first_name(self) -> str:
+        return self._s(self.first_name)
+
+    def _ctx(self, v: Any) -> dict:
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str) and v.strip():
+            import json as _json
+            try:
+                p = _json.loads(v.strip())
+                return p if isinstance(p, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def resolved_initial_context(self) -> dict:
+        return self._ctx(self.initial_context)
+
+    def resolved_gathered_context(self) -> dict:
+        return self._ctx(self.gathered_context)
+
+    def resolved_customer_intent(self) -> str:
+        s = self._s(self.customer_intent)
+        return (s or "order_status_check")[:64]
+
+
+async def _resolve_order_for_status(
+    db: AsyncSession, requested: str, call_id: str, phone: str
+) -> tuple[Any | None, str, str]:
+    """Return (order|None, effective_number, lookup_method).
+
+    Methods: exact | via_call_id | via_call_log | via_phone | none.
+    """
+    requested = (requested or "").strip()
+    if requested:
+        order = (
+            await db.execute(
+                select(Order)
+                .options(selectinload(Order.items), selectinload(Order.events))
+                .where(func.upper(Order.order_number) == requested.upper())
+            )
+        ).scalar_one_or_none()
+        if order:
+            return order, order.order_number, "exact"
+    # Fallback 1: latest order row stamped with this call_id.
+    if call_id:
+        o = (
+            await db.execute(
+                select(Order)
+                .options(selectinload(Order.items), selectinload(Order.events))
+                .where(Order.call_id == call_id)
+                .order_by(Order.id.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if o:
+            return o, o.order_number, "via_call_id"
+        # Fallback 2: Call Logs row for this call carries order_numbers.
+        c = (
+            await db.execute(select(Call).where(Call.call_id == call_id))
+        ).scalar_one_or_none()
+        if c and c.order_numbers:
+            last = str((c.order_numbers or [])[-1]).strip()
+            if last:
+                o2 = (
+                    await db.execute(
+                        select(Order)
+                        .options(selectinload(Order.items), selectinload(Order.events))
+                        .where(func.upper(Order.order_number) == last.upper())
+                    )
+                ).scalar_one_or_none()
+                if o2:
+                    return o2, o2.order_number, "via_call_log"
+    # Fallback 3: latest order for this phone.
+    if phone:
+        o3 = (
+            await db.execute(
+                select(Order)
+                .options(selectinload(Order.items), selectinload(Order.events))
+                .where(Order.customer_phone == phone.strip())
+                .order_by(Order.id.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        if o3:
+            return o3, o3.order_number, "via_phone"
+    return None, requested, "none"
+
+
+@router.post("/order-status", response_model=dict)
+async def order_status_post(req: OrderStatusLookupRequest, db: AsyncSession = Depends(get_db)):
+    """POST variant — Dograh sends {order_number, call_id, ...} as JSON body.
+
+    Configure in Dograh as HTTP API tool: POST <BASE>/api/tools/order-status
+    with params order_number (LLM), call_id preset {{workflow_run_id}},
+    customer_phone preset, provider/provider_call_id presets, etc.
+    When order_number arrives null/empty/unresolved, the endpoint resolves
+    the correct order via call_id (order row / call log) or phone instead
+    of returning not-found — then logs a Call Logs row of type order_status.
+    """
+    requested = req.resolved_order_number()
+    call_id = req.resolved_call_id()
+    phone = req.resolved_phone()
+    order, effective, method = await _resolve_order_for_status(db, requested, call_id, phone)
+    await _log_tool_call(
+        db,
+        call_id=call_id,
+        call_type="order_status",
+        call_purpose="order_status",
+        first_name=req.resolved_first_name(),
+        rsvp=clean_str(req.rsvp),
+        duration=req.resolved_duration(),
+        recording_url=clean_str(req.recording_url),
+        user_recording_url=clean_str(req.user_recording_url),
+        bot_recording_url=clean_str(req.bot_recording_url),
+        transcript_url=clean_str(req.transcript_url),
+        order_number=effective,
+        tool_name="order_status",
+        tool_summary=effective or requested or "(no order number)",
+        customer_name=order.customer_name if order else "",
+        customer_phone=order.customer_phone if order else phone,
+        provider=req.resolved_provider(),
+        provider_call_id=req.resolved_provider_call_id(),
+        initial_context=req.resolved_initial_context(),
+        gathered_context=req.resolved_gathered_context(),
+        customer_intent=req.resolved_customer_intent(),
+    )
+    if order is not None and order.customer_phone:
+        _cust = (await db.execute(
+            select(Customer).where(Customer.phone == order.customer_phone)
+        )).scalar_one_or_none()
+        if _cust is not None and not (_cust.last_intent or "").strip():
+            _cust.last_intent = "order_status_check"
+    await db.commit()
+    if order is None:
+        hint = (
+            "No order number was provided and none could be resolved from call_id/phone. "
+            "Ask the customer for their order number (e.g. PB-A1B) or phone number."
+            if not requested else f"No order found for {requested}"
+        )
+        return {"found": False, "message": hint,
+                "requested_order_number": requested, "resolved_order_number": "",
+                "lookup_method": method}
+    payload = OrderStatusResponse(found=True, order=order)  # type: ignore[arg-type]
+    data = payload.model_dump()
+    data["requested_order_number"] = requested
+    data["resolved_order_number"] = effective
+    data["lookup_method"] = method
+    return data
+
 
 @router.get("/orders/{order_number}", response_model=OrderStatusResponse)
 async def order_status(
@@ -434,6 +713,9 @@ class ReservationLogRequest(BaseModel):
     provider: str = ""
     provider_call_id: str = ""
     telephony_id: str = ""
+    initial_context: dict | None = None
+    gathered_context: dict | None = None
+    customer_intent: str = ""
 
 
 @router.post("/reservations", status_code=201)
@@ -476,6 +758,9 @@ async def log_reservation(req: ReservationLogRequest, db: AsyncSession = Depends
         tool_name="reservation", tool_summary=summary,
         provider=tmp.resolved_provider(),
         provider_call_id=tmp.resolved_provider_call_id(),
+        initial_context=req.initial_context or {},
+        gathered_context=req.gathered_context or {},
+        customer_intent=(req.customer_intent or "reservation")[:64],
     )
     _phone = clean_str(req.customer_phone)
     if _phone:

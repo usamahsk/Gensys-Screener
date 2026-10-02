@@ -103,9 +103,71 @@ Sample response (201):
 ```
 Read back `order_number` and `total` to confirm.
 
-## Tool 2 — `get_order_status`
+## Tool 2 — `get_order_status` (POST — recommended)
 
-**Method:** `GET`  **URL:** `<BASE>/api/tools/order-status?order_number={{order_number}}&call_id={{workflow_run_id}}`
+**Method:** `POST`  **URL:** `<BASE>/api/tools/order-status`
+
+Header: `Content-Type: application/json`
+
+Use POST so a missing/null `order_number` never fails: when the LLM sends
+`null`/empty, the endpoint resolves the correct order from `call_id`
+(latest order on this call / call-log order list) or `customer_phone`
+(latest order for that phone) and returns it. GET variants below still work.
+
+Parameters:
+
+| name         | type   | required | description for the LLM |
+|--------------|--------|----------|--------------------------|
+| order_number | string | no       | The order number the customer provided, e.g. PB-A1B. Send null/omit if not given — it will be resolved from the call. |
+| call_id | string | no | Preset `{{workflow_run_id}}` — logs a Call Logs row of type `order_status` and enables fallback resolution |
+| customer_phone | string | no | Preset/customer phone — fallback resolution when order_number is missing |
+| phone | string | no | Alias of customer_phone |
+| provider | string | no | Preset `dograh` |
+| provider_call_id | string | no | Preset telephony/SIP Call SID |
+| first_name | string | no | Preset `{{initial_context.first_name}}` |
+| rsvp | string | no | Preset `{{gathered_context.rsvp}}` |
+| duration | number | no | Preset `{{cost_info.call_duration_seconds}}` |
+| recording_url | string | no | Preset `{{recording_url}}` |
+| user_recording_url | string | no | Preset `{{user_recording_url}}` |
+| bot_recording_url | string | no | Preset `{{bot_recording_url}}` |
+| transcript_url | string | no | Preset `{{transcript_url}}` |
+| initial_context | object | no | Preset `{{initial_context}}` — stored on the call log |
+| gathered_context | object | no | Preset `{{gathered_context}}` — stored on the call log |
+| customer_intent | string | no | Captured intent, e.g. order_status_check — stored on the call log |
+
+Sample request (order_number unknown → resolved from the call):
+```json
+{
+  "order_number": null,
+  "call_id": "{{workflow_run_id}}",
+  "customer_phone": "{{initial_context.phone}}",
+  "provider": "dograh",
+  "provider_call_id": "{{initial_context.telephony_call_id}}",
+  "first_name": "{{initial_context.first_name}}",
+  "rsvp": "{{gathered_context.rsvp}}",
+  "duration": "{{cost_info.call_duration_seconds}}",
+  "recording_url": "{{recording_url}}",
+  "transcript_url": "{{transcript_url}}"
+}
+```
+
+Sample response (resolved via call):
+```json
+{
+  "found": true,
+  "order": { "order_number": "PB-A1B", "status": "preparing", "...": "..." },
+  "requested_order_number": "",
+  "resolved_order_number": "PB-A1B",
+  "lookup_method": "via_call_id"
+}
+```
+`lookup_method`: exact | via_call_id | via_call_log | via_phone | none.
+`found: false` → tell the customer the order number wasn't found, ask to re-check.
+
+## Tool 2 (legacy GET variants — still supported)
+
+**GET:** `<BASE>/api/tools/order-status?order_number={{order_number}}&call_id={{workflow_run_id}}`
+or `<BASE>/api/tools/orders/{{order_number}}?call_id={{workflow_run_id}}`
 
 Parameters (query):
 

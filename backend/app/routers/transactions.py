@@ -57,6 +57,9 @@ def _call_dict(c: Call) -> dict:
         "run_id": c.run_id,
         "workflow_id": c.workflow_id,
         "workflow_name": c.workflow_name or "",
+        "customer_intent": (c.customer_intent or c.call_purpose or "") or "",
+        "initial_context": c.initial_context or {},
+        "gathered_context": c.gathered_context or {},
     }
 
 
@@ -87,12 +90,18 @@ async def list_sessions(
     purpose: Optional[str] = None,
     order_status: Optional[str] = None,
     search: Optional[str] = None,
+    linked_only: bool = False,
+    has_provider_id: bool = False,
+    has_run: bool = False,
     limit: int = Query(default=100, le=200),
     db: AsyncSession = Depends(get_db),
 ):
     """List transactions. Filters: `purpose` = call intent (order_creation |
     order_status | reservation | general); `order_status` = linked-order
-    status incl. `incomplete` (sessions whose linked order has that status)."""
+    status incl. `incomplete` (sessions whose linked order has that status).
+    `linked_only` = only rows with ≥1 linked order (the Orders view);
+    `has_provider_id` = only rows with a provider/telephone id or Genesys
+    conversation id; `has_run` = only rows linked to a Dograh run id."""
     cq = select(Call).order_by(Call.started_at.desc()).limit(limit)
     if disposition:
         cq = cq.where(Call.disposition == disposition)
@@ -151,6 +160,13 @@ async def list_sessions(
             want = order_status.strip()
             if not any(o.status == want for o in linked):
                 continue
+        if linked_only and not linked:
+            continue
+        if has_run and not c.run_id:
+            continue
+        if has_provider_id and not ((c.provider_call_id or "").strip()
+                                     or (c.genesys_conversation_id or "").strip()):
+            continue
         transactions.append({
             "key": f"call:{c.call_id}",
             "started_at": c.started_at.isoformat() if c.started_at else "",
@@ -159,6 +175,10 @@ async def list_sessions(
         })
     for o in orphans:
         if order_status and o.status != order_status.strip():
+            continue
+        if has_run:
+            continue  # orphan orders have no run link
+        if has_provider_id and not (o.provider_call_id or "").strip():
             continue
         transactions.append({
             "key": f"order:{o.order_number}",

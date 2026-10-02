@@ -178,6 +178,13 @@ class Call(Base):
     workflow_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     run_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, index=True)
     workflow_name: Mapped[Optional[str]] = mapped_column(String(128), default="")
+    # Provider initial/gathered context snapshots (Dograh run contexts) so
+    # Call Logs show them without a live Dograh fetch. Webhooks persist
+    # these; tool calls merge what they carry.
+    initial_context: Mapped[dict] = mapped_column(JSONB, default=dict)
+    gathered_context: Mapped[dict] = mapped_column(JSONB, default=dict)
+    # Captured customer intent (classifier/tool purpose at capture time).
+    customer_intent: Mapped[Optional[str]] = mapped_column(String(64), default="")
     # create_order | order_status (tool call logs) | inbound | webhook | ...
     call_type: Mapped[Optional[str]] = mapped_column(String(16), default="")
     # Call purpose for dashboard filtering: order_creation | order_status |

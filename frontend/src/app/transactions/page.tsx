@@ -223,11 +223,16 @@ function effectiveProviderId(call: TransactionCall | null, orders: OrderRow[]): 
 }
 
 export default function TransactionsPage() {
+  const [view, setView] = useState<"orders" | "calls">("orders");
   const [sessions, setSessions] = useState<TransactionRow[]>([]);
+  const [callLogs, setCallLogs] = useState<import("@/lib/api").CallRow[]>([]);
   const [search, setSearch] = useState("");
   const [disposition, setDisposition] = useState("all");
   const [purpose, setPurpose] = useState("all");
   const [orderStatus, setOrderStatus] = useState("all");
+  const [linkedOnly, setLinkedOnly] = useState(true);
+  const [providerOnly, setProviderOnly] = useState(true);
+  const [runOnly, setRunOnly] = useState(false);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
@@ -242,20 +247,35 @@ export default function TransactionsPage() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await apiClient.transactions({
-        disposition: disposition === "all" ? undefined : disposition,
-        purpose: purpose === "all" ? undefined : purpose,
-        order_status: orderStatus === "all" ? undefined : orderStatus,
-        search: search.trim() || undefined,
-      });
-      setSessions(data.transactions);
-      setError("");
+      if (view === "calls") {
+        const rows = await apiClient.calls({
+          disposition: disposition === "all" ? undefined : disposition,
+          purpose: purpose === "all" ? undefined : purpose,
+          search: search.trim() || undefined,
+          has_provider_id: providerOnly || undefined,
+          has_run: runOnly || undefined,
+        });
+        setCallLogs(rows);
+        setError("");
+      } else {
+        const data = await apiClient.transactions({
+          disposition: disposition === "all" ? undefined : disposition,
+          purpose: purpose === "all" ? undefined : purpose,
+          order_status: orderStatus === "all" ? undefined : orderStatus,
+          search: search.trim() || undefined,
+          linked_only: linkedOnly || undefined,
+          has_provider_id: providerOnly || undefined,
+          has_run: runOnly || undefined,
+        });
+        setSessions(data.transactions);
+        setError("");
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load transactions");
     } finally {
       setLoading(false);
     }
-  }, [disposition, purpose, orderStatus, search]);
+  }, [view, disposition, purpose, orderStatus, search, linkedOnly, providerOnly, runOnly]);
 
   useEffect(() => {
     const t = setTimeout(load, search ? 400 : 0);
@@ -264,7 +284,7 @@ export default function TransactionsPage() {
 
   useEffect(() => {
     setPage(1);
-  }, [disposition, purpose, orderStatus, search]);
+  }, [view, disposition, purpose, orderStatus, search, linkedOnly, providerOnly, runOnly]);
 
   const backfill = async () => {
     setBackfilling(true);
@@ -288,9 +308,47 @@ export default function TransactionsPage() {
     }
   };
 
-  const totalPages = Math.max(1, Math.ceil(sessions.length / PAGE_SIZE));
+  const rows = view === "calls" ? callLogs : sessions;
+  const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
-  const paged = sessions.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const paged = view === "calls"
+    ? []
+    : (sessions as TransactionRow[]).slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const pagedCalls = (callLogs as import("@/lib/api").CallRow[]).slice(
+    (safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+
+  const openCallLog = async (c: import("@/lib/api").CallRow) => {
+    const pseudo: TransactionRow = {
+      key: `call:${c.call_id}`,
+      started_at: c.started_at,
+      call: {
+        ...c,
+        genesys_conversation_id: c.genesys_conversation_id || "",
+        run_id: c.run_id ?? null,
+        workflow_id: c.workflow_id ?? null,
+        workflow_name: c.workflow_name || "",
+      },
+      orders: (c.order_numbers || []).map((n) => ({
+        order_number: n,
+        customer_name: c.customer_name,
+        customer_phone: c.customer_phone,
+        order_type: "",
+        table_number: "",
+        pickup_time: "",
+        delivery_address: "",
+        payment_method: "",
+        status: "",
+        total: 0,
+        source: "",
+        item_count: 0,
+        created_at: c.started_at,
+        provider: c.provider,
+        provider_call_id: c.provider_call_id,
+        call_id: c.call_id,
+      })),
+    };
+    await openSession(pseudo);
+  };
 
   const openSession = async (s: TransactionRow) => {
     setSelected(s);
@@ -377,14 +435,23 @@ export default function TransactionsPage() {
   };
 
   const stats = useMemo(() => {
+    if (view === "calls") {
+      const talk = callLogs.reduce((sum, c) => sum + (c.duration_seconds || 0), 0);
+      const withProvider = callLogs.filter((c) => (c.provider_call_id || "").trim() || (c.genesys_conversation_id || "").trim()).length;
+      return [
+        { label: "Total call logs", value: callLogs.length, icon: PhoneCall },
+        { label: "With provider ID", value: withProvider, icon: Layers },
+        { label: "Talk time", value: fmtDuration(talk), icon: Clock },
+      ];
+    }
     const withOrders = sessions.filter((s) => s.orders.length > 0).length;
     const talk = sessions.reduce((sum, s) => sum + (s.call?.duration_seconds || 0), 0);
     return [
-      { label: "Total transactions", value: sessions.length, icon: Layers },
+      { label: "Linked transactions", value: sessions.length, icon: Layers },
       { label: "With orders", value: withOrders, icon: ShoppingCart },
       { label: "Talk time", value: fmtDuration(talk), icon: Clock },
     ];
-  }, [sessions]);
+  }, [sessions, callLogs, view]);
 
   const chain = selected
     ? {
@@ -425,15 +492,25 @@ export default function TransactionsPage() {
           : JSON.stringify(t.result, null, 2),
   }));
   const allTools = runEvidence && runEvidence.toolCalls.length > 0 ? runEvidence.toolCalls : savedTools;
-  const initialContext = runEvidence?.initialContext || {};
-  const gatheredContext = runEvidence?.gatheredContext || {};
+  // Context: prefer live Dograh run detail, fall back to the saved Call row
+  // snapshots so provider/initial/gathered/intent render even without a key.
+  const initialContext = Object.keys(runEvidence?.initialContext || {}).length > 0
+    ? runEvidence!.initialContext
+    : (callDetail?.initial_context || selected?.call?.initial_context || {});
+  const gatheredContext = Object.keys(runEvidence?.gatheredContext || {}).length > 0
+    ? runEvidence!.gatheredContext
+    : (callDetail?.gathered_context || selected?.call?.gathered_context || {});
+  const customerIntent = callDetail?.customer_intent || selected?.call?.customer_intent
+    || callDetail?.call_purpose || selected?.call?.call_purpose || "";
+  const customerLastIntent = callDetail?.customer_last_intent || "";
+  const customerLastOrder = callDetail?.customer_last_order || "";
 
   return (
     <div className="space-y-4">
       <PageHeader
         icon={ClipboardList}
-        title="Transactions"
-        description="Every call and order in one place — transaction record, linked orders, run evidence and the provider chain."
+        title="Transactions & Call Logs"
+        description="Transactions = only orders linked with a Dograh run + Genesys / provider ID. Call Logs = full call detail mapped with provider, contexts, intent, recordings, transcripts and tool calls."
         actions={
           <div className="flex items-center gap-2">
             <Button variant="outline" size="sm" onClick={backfill} disabled={backfilling} title="Fill empty Provider IDs and missing customer details on old rows from run details">
@@ -464,6 +541,22 @@ export default function TransactionsPage() {
       </div>
 
       <div className="flex flex-wrap items-center gap-3">
+        <div className="inline-flex rounded-lg bg-muted p-1">
+          <Button
+            size="sm"
+            variant={view === "orders" ? "default" : "ghost"}
+            onClick={() => setView("orders")}
+          >
+            <ShoppingCart className="mr-1 h-3.5 w-3.5" /> Transactions
+          </Button>
+          <Button
+            size="sm"
+            variant={view === "calls" ? "default" : "ghost"}
+            onClick={() => setView("calls")}
+          >
+            <PhoneCall className="mr-1 h-3.5 w-3.5" /> Call Logs
+          </Button>
+        </div>
         <div className="relative">
           <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
           <Input
@@ -495,22 +588,120 @@ export default function TransactionsPage() {
             ))}
           </SelectContent>
         </Select>
-        <Select value={orderStatus} onValueChange={setOrderStatus}>
-          <SelectTrigger className="w-48">
-            <SelectValue placeholder="All order statuses" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All order statuses</SelectItem>
-            {STATUSES.map((s) => (
-              <SelectItem key={s} value={s}>{s.replace("_", " ")}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <span className="text-sm text-muted-foreground">{sessions.length} transactions</span>
+        {view === "orders" && (
+          <Select value={orderStatus} onValueChange={setOrderStatus}>
+            <SelectTrigger className="w-48">
+              <SelectValue placeholder="All order statuses" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All order statuses</SelectItem>
+              {STATUSES.map((s) => (
+                <SelectItem key={s} value={s}>{s.replace("_", " ")}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <input type="checkbox" checked={linkedOnly} onChange={(e) => setLinkedOnly(e.target.checked)} disabled={view === "calls"} />
+          Linked orders only
+        </label>
+        <label className="flex items-center gap-1.5 text-xs text-muted-foreground" title="Only rows with a Dograh run-linked provider ID / Genesys conversation ID">
+          <input type="checkbox" checked={providerOnly} onChange={(e) => setProviderOnly(e.target.checked)} />
+          Has provider ID
+        </label>
+        <label className="flex items-center gap-1.5 text-xs text-muted-foreground" title="Only rows linked to a Dograh run ID">
+          <input type="checkbox" checked={runOnly} onChange={(e) => setRunOnly(e.target.checked)} />
+          Has run ID
+        </label>
+        <span className="text-sm text-muted-foreground">
+          {view === "calls" ? `${callLogs.length} call logs` : `${sessions.length} linked transactions`}
+        </span>
+      </div>
+
+      <div className="text-xs text-muted-foreground">
+        {view === "orders"
+          ? "Transactions = only orders linked with a Dograh run ID + Genesys conversation / provider ID."
+          : "Call Logs = every call with provider, initial + gathered context, customer intent, recordings, transcripts and tool calls."}
       </div>
 
       {error && <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>}
 
+      {view === "calls" ? (
+        <div className="card-clean overflow-x-auto">
+          <Table className="min-w-[860px]">
+            <TableHeader>
+              <TableRow>
+                <TableHead>Call</TableHead>
+                <TableHead>Customer</TableHead>
+                <TableHead>Intent</TableHead>
+                <TableHead>Provider</TableHead>
+                <TableHead>Provider ID</TableHead>
+                <TableHead>Run</TableHead>
+                <TableHead>Duration</TableHead>
+                <TableHead>When</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {pagedCalls.map((c) => (
+                <TableRow key={c.call_id} className="cursor-pointer hover:bg-[#F5F8FD]" onClick={() => openCallLog(c)}>
+                  <TableCell className="max-w-[150px] truncate font-mono text-xs font-semibold" title={c.call_id}>
+                    {c.call_id.slice(0, 18)}
+                    <div className="mt-1 flex flex-col items-start gap-1">
+                      <CallPurposeBadge type={c.call_type} purpose={c.call_purpose} />
+                      <DispositionBadge disposition={c.disposition} />
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex items-center gap-1.5 text-sm">
+                      <User className="h-3.5 w-3.5 text-muted-foreground" />
+                      {c.customer_name || c.first_name || "—"}
+                    </div>
+                    <div className="text-xs text-muted-foreground">{c.customer_phone || "—"}</div>
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant="secondary" className="bg-emerald-100 text-emerald-900 hover:bg-emerald-100">
+                      {(c.customer_intent || c.call_purpose || "—").replace("_", " ")}
+                    </Badge>
+                    {(c.order_numbers || []).length > 0 && (
+                      <div className="mt-1 flex flex-wrap gap-1">
+                        {(c.order_numbers || []).map((n) => (
+                          <Badge key={n} variant="outline" className="font-mono text-[11px]">{n}</Badge>
+                        ))}
+                      </div>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant="outline" className="text-[11px]">{c.provider || "dograh"}</Badge>
+                  </TableCell>
+                  <TableCell className="max-w-[140px] truncate font-mono text-[11px]" title={c.provider_call_id || c.genesys_conversation_id || ""}>
+                    {c.provider_call_id || c.genesys_conversation_id || "—"}
+                  </TableCell>
+                  <TableCell className="font-mono text-[11px]">{c.run_id ? `#${c.run_id}` : "—"}</TableCell>
+                  <TableCell>
+                    <span className="flex items-center gap-1 text-sm">
+                      <Clock className="h-3.5 w-3.5 text-muted-foreground" />
+                      {fmtDuration(c.duration_seconds || 0)}
+                    </span>
+                  </TableCell>
+                  <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
+                    {c.started_at ? fmtDateTime(c.started_at) : "—"}
+                  </TableCell>
+                </TableRow>
+              ))}
+              {callLogs.length === 0 && !error && (
+                <TableRow>
+                  <TableCell colSpan={8} className="py-8 text-center text-muted-foreground">
+                    {loading ? "Loading call logs…" : "No call logs yet."}
+                  </TableCell>
+                </TableRow>
+              )}
+            </TableBody>
+          </Table>
+        </div>
+      ) : (
+        <div></div>
+      )}
+      {view === "orders" && (
       <div className="card-clean overflow-x-auto">
         <Table className="min-w-[760px]">
           <TableHeader>
@@ -599,6 +790,7 @@ export default function TransactionsPage() {
           </TableBody>
         </Table>
       </div>
+      )}
       <Pagination page={safePage} totalPages={totalPages} onChange={setPage} />
 
       <Dialog open={!!selected} onOpenChange={(open) => !open && setSelected(null)}>
@@ -646,6 +838,28 @@ export default function TransactionsPage() {
                   <div className="min-w-0">
                     <div className="text-xs text-muted-foreground">Duration</div>
                     <div className="text-xs">{fmtDuration(selected.call?.duration_seconds || 0)}</div>
+                  </div>
+                  <div className="min-w-0 sm:col-span-2">
+                    <div className="text-xs text-muted-foreground">Customer intent captured</div>
+                    <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                      {customerIntent ? (
+                        <Badge className="bg-emerald-600 text-white hover:bg-emerald-600">
+                          {customerIntent.replace(/_/g, " ")}
+                        </Badge>
+                      ) : (
+                        <span className="text-xs text-muted-foreground">—</span>
+                      )}
+                      {customerLastIntent && customerLastIntent !== customerIntent && (
+                        <Badge variant="outline" className="text-[11px]">
+                          memory: {customerLastIntent.replace(/_/g, " ")}
+                        </Badge>
+                      )}
+                      {customerLastOrder && (
+                        <Badge variant="outline" className="font-mono text-[11px]">
+                          last order {customerLastOrder}
+                        </Badge>
+                      )}
+                    </div>
                   </div>
                 </div>
               )}
@@ -805,6 +1019,42 @@ export default function TransactionsPage() {
               </div>
               <div className="grid min-w-0 max-w-full content-start gap-4 overflow-x-clip xl:border-l xl:border-[#E2E8F4] xl:pl-6">
                 <div className="text-xs font-semibold tracking-wide text-muted-foreground">CONTEXT</div>
+                <div className="min-w-0 rounded-xl border border-[#E2E8F4] p-3">
+                  <div className="mb-1 text-xs font-semibold text-muted-foreground">Provider</div>
+                  <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                    <Badge variant="outline">{selected.call?.provider || selected.orders[0]?.provider || "dograh"}</Badge>
+                    <span className="break-all font-mono text-[11px]">{effectiveProviderId(selected.call, selected.orders) || "—"}</span>
+                  </div>
+                  {selected.call?.genesys_conversation_id && (
+                    <div className="mt-1 break-all font-mono text-[11px] text-muted-foreground">
+                      genesys: {selected.call.genesys_conversation_id}
+                    </div>
+                  )}
+                  {selected.call?.run_id && (
+                    <div className="mt-1 font-mono text-[11px] text-muted-foreground">
+                      dograh run #{selected.call.run_id}
+                      {selected.call.workflow_id ? ` · workflow ${selected.call.workflow_id}` : ""}
+                    </div>
+                  )}
+                </div>
+                <div className="min-w-0 rounded-xl border border-[#E2E8F4] p-3">
+                  <div className="mb-1 text-xs font-semibold text-muted-foreground">Customer intent captured</div>
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {customerIntent ? (
+                      <Badge className="bg-emerald-600 text-white hover:bg-emerald-600">
+                        {customerIntent.replace(/_/g, " ")}
+                      </Badge>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">No intent captured.</span>
+                    )}
+                  </div>
+                  {(customerLastIntent || customerLastOrder) && (
+                    <div className="mt-1 text-[11px] text-muted-foreground">
+                      {customerLastIntent && <>memory intent: {customerLastIntent.replace(/_/g, " ")} · </>}
+                      {customerLastOrder && <>last order: <span className="font-mono">{customerLastOrder}</span></>}
+                    </div>
+                  )}
+                </div>
                 <div className="min-w-0 rounded-xl border border-[#E2E8F4] p-3">
                   <div className="mb-1 text-xs font-semibold text-muted-foreground">Initial context</div>
                   {Object.keys(initialContext).length > 0 ? (

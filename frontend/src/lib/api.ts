@@ -76,6 +76,15 @@ export interface CallRow {
   transcript_url: string;
   provider: string;
   provider_call_id: string;
+  genesys_conversation_id?: string;
+  run_id?: number | null;
+  workflow_id?: number | null;
+  workflow_name?: string;
+  customer_intent?: string;
+  customer_last_intent?: string;
+  customer_last_order?: string;
+  initial_context?: Record<string, unknown>;
+  gathered_context?: Record<string, unknown>;
 }
 
 export interface TranscriptTurn {
@@ -97,6 +106,7 @@ export interface CallDetail extends CallRow {
   run_id: number | null;
   workflow_name: string;
   call_type: string;
+  customer_context?: Record<string, unknown>;
 }
 
 export interface TransactionCall extends CallRow {
@@ -288,17 +298,17 @@ export const apiClient = {
       method: "PUT",
       body: JSON.stringify(payload),
     }),
-  calls: (params?: { disposition?: string; call_type?: string; purpose?: string; search?: string }) => {
+  calls: (params?: { disposition?: string; call_type?: string; purpose?: string; search?: string; has_provider_id?: boolean; has_run?: boolean }) => {
     const qs = new URLSearchParams(
-      Object.entries(params || {}).filter(([, v]) => v) as [string, string][]
+      Object.entries(params || {}).filter(([, v]) => v !== undefined && v !== "" && v !== false) as [string, string][]
     );
     const suffix = qs.toString() ? `?${qs}` : "";
     return api<CallRow[]>(`/api/calls${suffix}`);
   },
   callDetail: (callId: string) => api<CallDetail>(`/api/calls/${callId}`),
-  transactions: (params?: { disposition?: string; purpose?: string; order_status?: string; search?: string }) => {
+  transactions: (params?: { disposition?: string; purpose?: string; order_status?: string; search?: string; linked_only?: boolean; has_provider_id?: boolean; has_run?: boolean }) => {
     const qs = new URLSearchParams(
-      Object.entries(params || {}).filter(([, v]) => v) as [string, string][]
+      Object.entries(params || {}).filter(([, v]) => v !== undefined && v !== "" && v !== false) as [string, string][]
     );
     const suffix = qs.toString() ? `?${qs}` : "";
     return api<{ transactions: TransactionRow[]; total: number }>(`/api/transactions${suffix}`);

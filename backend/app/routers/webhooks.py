@@ -90,6 +90,15 @@ async def call_ended(
         if not (existing.first_name or "").strip() and payload.resolved_first_name():
             existing.first_name = payload.resolved_first_name()
             updated_fields.append("first_name")
+        if payload.initial_context and not (existing.initial_context or {}):
+            existing.initial_context = payload.initial_context
+            updated_fields.append("initial_context")
+        if payload.gathered_context and not (existing.gathered_context or {}):
+            existing.gathered_context = payload.gathered_context
+            updated_fields.append("gathered_context")
+        if incoming_purpose and not (existing.customer_intent or "").strip():
+            existing.customer_intent = incoming_purpose[:64]
+            updated_fields.append("customer_intent")
         if updated_fields:
             existing.ended_at = existing.ended_at or datetime.now(timezone.utc)
             await db.commit()
@@ -152,6 +161,9 @@ async def call_ended(
         provider=provider,
         provider_call_id=provider_call_id,
         call_purpose=_webhook_purpose,
+        initial_context=payload.initial_context or {},
+        gathered_context=payload.gathered_context or {},
+        customer_intent=(_webhook_purpose or "")[:64],
     )
     db.add(call)
 

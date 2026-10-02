@@ -150,6 +150,11 @@ class OrderCreateRequest(BaseModel):
     user_recording_url: Optional[str] = ""
     bot_recording_url: Optional[str] = ""
     transcript_url: Optional[str] = ""
+    # Full provider contexts (Dograh run initial/gathered) + captured intent.
+    # Accepted as dicts or JSON strings; stored on the Call Logs row.
+    initial_context: dict[str, Any] = {}
+    gathered_context: dict[str, Any] = {}
+    customer_intent: Optional[str] = ""
 
     @model_validator(mode="before")
     @classmethod
@@ -327,6 +332,32 @@ class OrderCreateRequest(BaseModel):
         # delivery, pickup, takeaway, takeout, collection → takeaway
         return "takeaway"
 
+    @field_validator("initial_context", "gathered_context", mode="before")
+    @classmethod
+    def _coerce_contexts(cls, v: Any) -> Any:
+        if isinstance(v, dict):
+            return v
+        if v in (None, "") or is_unresolved_template(v):
+            return {}
+        if isinstance(v, str):
+            import json
+            try:
+                parsed = json.loads(v.strip())
+                return parsed if isinstance(parsed, dict) else {}
+            except (json.JSONDecodeError, ValueError, AttributeError):
+                return {}
+        return {}
+
+    @field_validator("customer_intent", mode="before")
+    @classmethod
+    def _coerce_intent(cls, v: Any) -> Any:
+        if v in (None, "") or is_unresolved_template(v):
+            return ""
+        s = str(v).strip()
+        if s.startswith("<") and s.endswith(">"):
+            return ""
+        return s[:64]
+
     def resolved_call_id(self) -> str:
         return (self.call_id or self.workflow_run_id or "").strip()
 
@@ -345,6 +376,15 @@ class OrderCreateRequest(BaseModel):
 
     def resolved_first_name(self) -> str:
         return clean_str(self.first_name)
+
+    def resolved_customer_intent(self) -> str:
+        return clean_str(self.customer_intent)
+
+    def resolved_initial_context(self) -> dict[str, Any]:
+        return self.initial_context if isinstance(self.initial_context, dict) else {}
+
+    def resolved_gathered_context(self) -> dict[str, Any]:
+        return self.gathered_context if isinstance(self.gathered_context, dict) else {}
 
 
 class OrderItemOut(BaseModel):
