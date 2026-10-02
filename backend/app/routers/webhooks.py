@@ -66,9 +66,22 @@ async def call_ended(
         if incoming_purpose and (existing.call_purpose or "").strip() in ("", "general"):
             existing.call_purpose = incoming_purpose
             updated_fields.append("call_purpose")
-        if payload.tool_calls and not (existing.tool_calls or []):
-            existing.tool_calls = payload.tool_calls
-            updated_fields.append("tool_calls")
+        if payload.tool_calls:
+            # Merge instead of dropping: the row may already hold the live
+            # tool call (e.g. pending create_order) while the webhook brings
+            # the rest. Dedupe on (name, args_summary) so retries stay clean.
+            seen = {
+                (str(t.get("name", "")), str(t.get("args_summary", "")))
+                for t in (existing.tool_calls or []) if isinstance(t, dict)
+            }
+            extra = [
+                t for t in payload.tool_calls
+                if isinstance(t, dict)
+                and (str(t.get("name", "")), str(t.get("args_summary", ""))) not in seen
+            ]
+            if extra:
+                existing.tool_calls = [*(existing.tool_calls or []), *extra]
+                updated_fields.append("tool_calls")
         if not (existing.summary or "").strip():
             new_summary = await summarize(
                 payload.transcript, payload.tool_calls, incoming_disposition,
@@ -81,6 +94,25 @@ async def call_ended(
         if payload.order_number and payload.order_number not in (existing.order_numbers or []):
             existing.order_numbers = [*(existing.order_numbers or []), payload.order_number]
             updated_fields.append("order_numbers")
+        for n in payload.order_numbers or []:
+            if n and n not in (existing.order_numbers or []):
+                existing.order_numbers = [*(existing.order_numbers or []), n]
+                if "order_numbers" not in updated_fields:
+                    updated_fields.append("order_numbers")
+        # Fill recording/transcript links the first payload didn't carry —
+        # recovery downloads the transcript from transcript_url later.
+        if not (existing.transcript_url or "").strip() and payload.transcript_url:
+            existing.transcript_url = payload.transcript_url
+            updated_fields.append("transcript_url")
+        if not (existing.recording_url or "").strip() and payload.resolved_recording_url():
+            existing.recording_url = payload.resolved_recording_url()
+            updated_fields.append("recording_url")
+        if not (existing.user_recording_url or "").strip() and payload.user_recording_url:
+            existing.user_recording_url = payload.user_recording_url
+            updated_fields.append("user_recording_url")
+        if not (existing.bot_recording_url or "").strip() and payload.bot_recording_url:
+            existing.bot_recording_url = payload.bot_recording_url
+            updated_fields.append("bot_recording_url")
         if not (existing.customer_phone or "").strip() and payload.resolved_customer_phone():
             existing.customer_phone = payload.resolved_customer_phone()
             updated_fields.append("customer_phone")
@@ -99,11 +131,44 @@ async def call_ended(
         if incoming_purpose and not (existing.customer_intent or "").strip():
             existing.customer_intent = incoming_purpose[:64]
             updated_fields.append("customer_intent")
+        # The row may exist from a live tool call (e.g. a pending
+        # create_order with no items) while NO order was ever built. Run the
+        # same transcript extraction as the new-row path instead of returning
+        # early — otherwise the order never appears in Transactions.
+        extracted_order_number: str | None = None
+        if not (existing.order_numbers or []) and not await _call_has_order(db, call_id):
+            try:
+                text = _payload_text(payload) or _turns_text(existing.transcript)
+                recovered = await _run_transcript_extraction(
+                    db, existing, text,
+                    payload.transcript_url or existing.transcript_url,
+                    existing.customer_name, existing.customer_phone, call_id,
+                )
+                if recovered is not None:
+                    if recovered.order_number not in (existing.order_numbers or []):
+                        existing.order_numbers = [
+                            *(existing.order_numbers or []), recovered.order_number]
+                    extracted_order_number = recovered.order_number
+                    updated_fields.append("order_numbers")
+            except Exception as e:
+                logger.warning(f"call {call_id!r}: existing-row extraction failed ({e})")
         if updated_fields:
             existing.ended_at = existing.ended_at or datetime.now(timezone.utc)
             await db.commit()
-            return {"status": "updated", "call_id": call_id,
-                    "updated": updated_fields, "disposition": existing.disposition}
+            resp: dict = {"status": "updated", "call_id": call_id,
+                          "updated": updated_fields, "disposition": existing.disposition}
+            if extracted_order_number:
+                resp["order_number"] = extracted_order_number
+            else:
+                # Still nothing (no transcript yet?) — let the background job
+                # retry via transcript_url / voice-platform run transcript.
+                from app.services.order_recovery import recover_order_from_call
+                background.add_task(recover_order_from_call, call_id, None)
+            return resp
+        # Fully duplicate webhook — but still ensure an order isn't missing.
+        if not (existing.order_numbers or []) and not await _call_has_order(db, call_id):
+            from app.services.order_recovery import recover_order_from_call
+            background.add_task(recover_order_from_call, call_id, None)
         return {"status": "duplicate", "call_id": call_id}
 
     disposition = payload.resolved_disposition()
@@ -199,43 +264,11 @@ async def call_ended(
         # call purpose (no row); order_creation always creates a row —
         # `confirmed` when complete, `incomplete` when fields are missing.
         try:
-            from app.services.order_recovery import (
-                _apply_extraction,
-                _download_text,
-                _transcript_text,
-                analyze_transcript,
-                build_order_from_req,
-                get_google_key,
+            order = await _run_transcript_extraction(
+                db, call, _payload_text(payload), payload.transcript_url,
+                customer_name, customer_phone, call_id,
             )
-            existing = (
-                await db.execute(
-                    select(Order)
-                    .options(selectinload(Order.items), selectinload(Order.events))
-                    .where(Order.call_id == call_id)
-                    .order_by(Order.id.desc()).limit(1)
-                )
-            ).scalars().first()
-            text = _transcript_text(payload)
-            if not text and payload.transcript_url:
-                text = await _download_text(payload.transcript_url)
-            api_key, model, enabled = await get_google_key(db)
-            result = (
-                await analyze_transcript(text, api_key, model)
-                if (enabled and api_key and text.strip()) else None
-            )
-            if result is not None:
-                if (call.call_purpose or "").strip() in ("", "general"):
-                    call.call_purpose = result["purpose"] or _webhook_purpose
-                req = result["req"]
-                if req is not None:
-                    if existing:
-                        _apply_extraction(existing, req, call, shell_empty=not existing.items)
-                        order = existing
-                    else:
-                        order = await build_order_from_req(
-                            db, req, list(result["missing"] or []), text,
-                            call, customer_name, customer_phone, call_id)
-            elif not (call.call_purpose or "").strip() and _webhook_purpose:
+            if order is None and not (call.call_purpose or "").strip() and _webhook_purpose:
                 # No LLM result: keep the flag/keyword purpose; never invent
                 # "general" — unknown stays empty until the classifier runs.
                 call.call_purpose = _webhook_purpose
@@ -340,6 +373,84 @@ async def _materialize_order(
         ))
     db.add(OrderEvent(order_id=order.id, status="confirmed",
                       note="Order recorded from post-call summary"))
+    return order
+
+
+async def _call_has_order(db: AsyncSession, call_id: str) -> bool:
+    """True when any order row already belongs to this call."""
+    if not call_id or call_id == "unknown":
+        return False
+    oid = (await db.execute(
+        select(Order.id).where(Order.call_id == call_id).limit(1)
+    )).scalar_one_or_none()
+    return oid is not None
+
+
+def _turns_text(transcript: Any) -> str:
+    """Flat text from saved transcript turns (existing-row extraction)."""
+    parts: list[str] = []
+    for t in transcript or []:
+        if isinstance(t, dict):
+            c = t.get("content") or t.get("text") or ""
+            if c:
+                parts.append(f"{t.get('role', 'unknown')}: {c}")
+        elif isinstance(t, str) and t.strip():
+            parts.append(t.strip())
+    return "\n".join(parts)
+
+
+async def _run_transcript_extraction(
+    db: AsyncSession, call: Call, text: str, transcript_url: str,
+    customer_name: str, customer_phone: str, call_id: str,
+) -> Order | None:
+    """Shared Gemini extraction for webhook paths (new-row + existing-row).
+
+    Tags the call purpose, builds/applies the order when the transcript is
+    an order_creation attempt, and links the number onto the call. Returns
+    the order or None (status/reservation/general, no transcript, no key).
+    """
+    from app.services.order_recovery import (
+        _apply_extraction,
+        _download_text,
+        analyze_transcript,
+        build_order_from_req,
+        get_google_key,
+    )
+    existing_order = (
+        await db.execute(
+            select(Order)
+            .options(selectinload(Order.items), selectinload(Order.events))
+            .where(Order.call_id == call_id)
+            .order_by(Order.id.desc()).limit(1)
+        )
+    ).scalars().first()
+    if not (text or "").strip() and transcript_url:
+        text = await _download_text(transcript_url)
+        if (text or "").strip() and not (call.transcript or []):
+            from app.services.order_recovery import MAX_TRANSCRIPT_CHARS as _MAX
+
+            call.transcript = [{"role": "transcript", "content": text[:_MAX]}]
+    api_key, model, enabled = await get_google_key(db)
+    result = (
+        await analyze_transcript(text, api_key, model)
+        if (enabled and api_key and (text or "").strip()) else None
+    )
+    if result is None:
+        return None
+    if (call.call_purpose or "").strip() in ("", "general") and result["purpose"]:
+        call.call_purpose = result["purpose"]
+    req = result["req"]
+    if req is None:
+        return None
+    if existing_order:
+        _apply_extraction(existing_order, req, call, shell_empty=not existing_order.items)
+        order = existing_order
+    else:
+        order = await build_order_from_req(
+            db, req, list(result["missing"] or []), text,
+            call, customer_name, customer_phone, call_id)
+    if order.order_number not in (call.order_numbers or []):
+        call.order_numbers = [*(call.order_numbers or []), order.order_number]
     return order
 
 

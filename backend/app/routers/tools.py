@@ -198,6 +198,24 @@ async def create_order(
         f"call_id={req.resolved_call_id()!r}"
     )
     if not req.customer_phone.strip() or not req.items:
+        # Debug aid: log the raw top-level keys Dograh actually sent so an
+        # empty-items pending call can be traced in api logs (wrong key name,
+        # stringified array, {{...}} literal, ...).
+        try:
+            import json as _json
+
+            raw_body = (await request.body()).decode("utf-8", errors="replace")
+            raw_keys = sorted(_json.loads(raw_body).keys()) if raw_body.strip().startswith("{") else []
+        except Exception:
+            raw_keys = []
+        missing = [f for f, ok in (
+            ("customer_phone", bool(req.customer_phone.strip())),
+            ("items", bool(req.items)),
+        ) if not ok]
+        logger.warning(
+            f"POST /api/tools/orders PENDING (missing={missing}) "
+            f"call_id={req.resolved_call_id()!r} raw_keys={raw_keys}"
+        )
         await _log_tool_call(
             db,
             call_id=req.resolved_call_id(),
@@ -224,6 +242,12 @@ async def create_order(
         await db.commit()
         return OrderCreatedResponse(
             order_number="", total=D("0"), status="pending", items=[],
+            message=(
+                f"Order noted but incomplete (missing: {', '.join(missing)}). "
+                "Do NOT read out any order number to the customer — none was "
+                "created. Collect the missing details and call create_order "
+                "again with the full items list."
+            ),
         )
 
     total = 0.0

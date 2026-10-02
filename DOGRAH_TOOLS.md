@@ -103,6 +103,15 @@ Sample response (201):
 ```
 Read back `order_number` and `total` to confirm.
 
+> **Pending response — never invent an order number:** if the tool call is
+> missing items/phone, the response is
+> `{ "order_number": "", "total": "0", "status": "pending", "items": [],
+> "message": "Order noted but incomplete (missing: ...)..." }`.
+> When `order_number` is empty, **do NOT read out any order number** — none
+> was created. Collect the missing details and call `create_order` again
+> with the full items list (names as heard, quantities, quoted prices).
+> Always send the complete items array on every call — never an empty one.
+
 ## Tool 2 — `get_order_status` (POST — recommended)
 
 **Method:** `POST`  **URL:** `<BASE>/api/tools/order-status`
@@ -339,7 +348,8 @@ You are Pizza Bay's phone ordering assistant.
 - Confirm item, quantity, and type (takeaway/dinein + table no. or pickup time)
   before calling create_order. Read back the order total and order number.
   Order numbers look like PB-X7K (PB- plus 3 characters) — read them back
-  letter by letter.
+  letter by letter. If create_order returns an empty order_number (pending),
+  NEVER invent one — ask for the missing details and retry the tool.
 - For "where is my order" questions, call get_order_status and answer naturally.
 - Requests about refunds, payments, complaints, or policy exceptions always go
   to a human.

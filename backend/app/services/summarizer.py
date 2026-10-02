@@ -141,10 +141,13 @@ def _extractive(transcript: list[dict], tool_calls: list[dict], disposition: str
     if not intent and (purpose or "").strip().lower() in _PURPOSE_INTENT:
         intent = _PURPOSE_INTENT[(purpose or "").strip().lower()]
     actions = [tc.get("name", "?") for tc in tool_calls]
-    action_part = f" Actions taken: {', '.join(actions)}." if actions else ""
+    action_part = f"Actions taken: {', '.join(actions)}." if actions else ""
     outcome = {
         "transferred": "Call was transferred to a human agent.",
         "failed": "Call ended in error.",
         "abandoned": "Customer hung up before completion.",
     }.get(disposition, "Call completed successfully.")
-    return f"Customer intent: {intent or 'not captured'}.{action_part} {outcome}"
+    if intent:
+        return f"Customer intent: {intent}.{(' ' + action_part) if action_part else ''} {outcome}"
+    # No intent evidence — never print "not captured", just state actions + outcome.
+    return f"{action_part} {outcome}".strip()

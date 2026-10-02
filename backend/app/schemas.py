@@ -2,6 +2,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Optional
 
+import re
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 JUNK_STRINGS = {"none", "n/a", "na", "null", "nil", "-", "no", "not provided"}
@@ -66,12 +68,25 @@ class OrderItemIn(BaseModel):
             stripped = {str(k).strip(): v for k, v in data.items()}
             if stripped is not data and any(str(k) != str(k).strip() for k in data):
                 data = stripped
+            # case-insensitive keys ("Name", "Quantity", "UnitPrice"...)
+            lowered = {str(k).strip().lower(): v for k, v in data.items()}
+            for canonical in ("sku", "name", "quantity", "unit_price", "price",
+                              "size", "notes", "item", "dish", "product", "title"):
+                if canonical not in data and canonical not in lowered:
+                    continue
+                if canonical in lowered and canonical not in data:
+                    data[canonical] = lowered[canonical]
             # price == unit_price; item/item_name/dish == name
             if "price" in data and "unit_price" not in data:
                 data["unit_price"] = data["price"]
-            for alt in ("item", "item_name", "dish", "product", "product_name"):
-                if alt in data and "name" not in data:
-                    data["name"] = data[alt]
+            if "unitprice" in lowered and "unit_price" not in data and "price" not in data:
+                data["unit_price"] = lowered["unitprice"]
+            for alt in ("item", "item_name", "itemname", "dish", "dish_name", "dishname",
+                        "product", "product_name", "productname", "title",
+                        "menu_item", "menu item", "menuitem"):
+                if alt in lowered and "name" not in data:
+                    data["name"] = lowered[alt]
+                    break
         return data
 
     @field_validator("sku", "name", "size", "notes", mode="before")
@@ -105,8 +120,17 @@ class OrderItemIn(BaseModel):
     def _coerce_price(cls, v: Any) -> Any:
         if v in (None, "") or is_unresolved_template(v):
             return 0
+        if isinstance(v, str):
+            # tolerate "$15.99", "15.99 USD", "1,299.00"
+            cleaned = re.sub(r"[^\d.\-]", "", v.replace(",", ""))
+            if cleaned and cleaned not in ("-", "."):
+                try:
+                    return float(cleaned)
+                except (ValueError, TypeError):
+                    pass
+            return 0
         try:
-            return float(str(v))
+            return float(v)  # type: ignore[arg-type]
         except (ValueError, TypeError):
             return 0
 
@@ -181,6 +205,16 @@ class OrderCreateRequest(BaseModel):
             "name": "customer_name",
             "order items": "items",
             "order_items": "items",
+            "orderitems": "items",
+            "dishes": "items",
+            "products": "items",
+            "cart": "items",
+            "line_items": "items",
+            "line items": "items",
+            "lineitems": "items",
+            "order_details": "items",
+            "order details": "items",
+            "orderdetails": "items",
             "order type": "order_type",
             "fulfillment type": "order_type",
             "fulfillment_type": "order_type",
@@ -222,18 +256,25 @@ class OrderCreateRequest(BaseModel):
         if isinstance(v, dict):
             return [v]
         if isinstance(v, str):
+            import ast
             import json
 
             s = v.strip()
             if not s or is_unresolved_template(s):
                 return []
+            parsed: Any = None
             try:
                 parsed = json.loads(s)
             except (json.JSONDecodeError, ValueError):
-                return []
+                try:
+                    parsed = ast.literal_eval(s)
+                except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+                    return []
             if isinstance(parsed, dict):
                 return [parsed]
-            return parsed
+            if isinstance(parsed, list):
+                return parsed
+            return []
         return v
 
     @field_validator("duration", "duration_seconds", mode="before")
@@ -437,6 +478,9 @@ class OrderCreatedResponse(BaseModel):
     total: Decimal
     status: str
     items: list[OrderItemOut]
+    # Agent instruction channel: pending responses tell the LLM not to invent
+    # an order number; confirmed responses leave it empty.
+    message: str = ""
 
 
 class OrderStatusResponse(BaseModel):

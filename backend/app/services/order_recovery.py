@@ -42,24 +42,60 @@ def _gen_order_number() -> str:
     return f"PB-{''.join(secrets.choice(_ORDER_CODE_ALPHABET) for _ in range(3))}"
 
 
-def _extract_order_number_from_text(text: str) -> str:
-    """Regex fallback when the LLM returns no order_number.
+def _valid_order_number(raw: object) -> str:
+    """Accept only real PB-style codes (PB- + 3-10 phone-safe chars).
 
-    Picks up PB-XXX codes and generic 'order (number|id|#) <code>' mentions
-    straight from the transcript so we never invent an ID.
+    The voice agent sometimes hallucinates a number ("P-B two four") when a
+    tool call returns empty — that must never become a stored order number.
+    Normalizes separators/case ("pb a1b" → "PB-A1B"); anything else → "".
+    """
+    if not raw or not isinstance(raw, str):
+        return ""
+    s = raw.strip().upper().replace(" ", "").replace("_", "")
+    m = re.fullmatch(r"P-?B-?([A-Z0-9]{3,10})", s)
+    if not m:
+        return ""
+    code = m.group(1)
+    if any(ch not in _ORDER_CODE_SET for ch in code):
+        return ""
+    return f"PB-{code}"
+
+
+_ORDER_CODE_SET = set(_ORDER_CODE_ALPHABET)
+
+
+def _plausible_order_number(raw: object) -> str:
+    """Loose shape check: real order numbers never contain spaces.
+
+    Used for missing-field computation and legacy (KFC-hex) codes. An
+    agent-hallucinated number ("P-B two four") always contains spaces and
+    is rejected here; strict PB validation + DB existence still decide
+    what actually gets stored.
+    """
+    if not raw or not isinstance(raw, str):
+        return ""
+    s = raw.strip().upper()
+    if not s or " " in s or len(s) > 16:
+        return ""
+    if not re.fullmatch(r"[A-Z0-9][A-Z0-9\-]{2,15}", s):
+        return ""
+    return s
+
+
+def _extract_order_number_from_text(text: str) -> str:
+    """Strict PB-code fallback when the LLM returns no order_number.
+
+    Only true PB-style codes are accepted so an agent-hallucinated number
+    spoken in the transcript ("P-B two four") never becomes a stored order.
     """
     if not text:
         return ""
-    m = re.search(r"\bPB-[A-Z0-9]{3,10}\b", text, re.IGNORECASE)
-    if m:
-        return m.group(0).upper().strip()
-    m = re.search(
-        r"order\s*(?:number|no\.?|id|#)?\s*(?:is|:)?\s*([A-Z0-9][A-Z0-9\-]{2,30})",
-        text, re.IGNORECASE,
-    )
-    if m:
-        cand = m.group(1).strip().strip(".,;:!?\"'").upper()
-        if cand and cand not in {"IS", "THE", "A", "AN"}:
+    # Code immediately after the PB prefix (separators tolerated). The group
+    # itself has no spaces so trailing words ("PB-A1B confirmed") can't
+    # poison the match; _valid_order_number rejects non-alphabet codes.
+    for m in re.finditer(r"\bP\s?-?\s?B\s?-?\s?([A-Z0-9]{3,10})\b", text, re.IGNORECASE):
+        cand = _valid_order_number("PB-" + m.group(1))
+        if cand:
             return cand
     return ""
 
@@ -134,7 +170,9 @@ def _compute_missing(req, text: str) -> list[str]:
         missing.append("customer_phone")
     if not req.items:
         missing.append("items")
-    number = clean_str(req.order_number) or _extract_order_number_from_text(text or "")
+    number = _valid_order_number(clean_str(req.order_number)) \
+        or _extract_order_number_from_text(text or "") \
+        or _plausible_order_number(clean_str(req.order_number))
     if not number:
         missing.append("order_number")
     if not req.order_confirmed:
@@ -471,8 +509,19 @@ async def build_order_from_req(db, req, missing: list[str], text: str,
     """
     from app.schemas import clean_str as _clean
     items, total, _fee = _finalize_items(req, _clean(req.delivery_address))
-    number = (_clean(req.order_number) or "").strip().upper() \
-        or _extract_order_number_from_text(text or "")
+    # Never store an agent-hallucinated number ("P-B two four"): only a
+    # valid PB-style code is kept, otherwise fall back to transcript text,
+    # otherwise a plausible legacy code ONLY if it matches a real order row,
+    # otherwise generate a fresh one.
+    raw_num = (_clean(req.order_number) or "").strip().upper()
+    number = _valid_order_number(raw_num) or _extract_order_number_from_text(text or "")
+    if not number and _plausible_order_number(raw_num):
+        from sqlalchemy import func as _func
+        dup = (await db.execute(
+            select(Order.id).where(_func.upper(Order.order_number) == raw_num)
+        )).scalar_one_or_none()
+        if dup is not None:
+            number = raw_num
     missing = list(missing or [])
     phone = (req.customer_phone or "").strip() or customer_phone or _extract_phone_from_text(text or "")
     name = (req.customer_name or "").strip() or customer_name
@@ -647,6 +696,10 @@ async def recover_order_from_call(call_id: str, order_number: str | None = None)
             text = await _transcript_from_run(db, call) or ""
         if not text.strip():
             return {"status": "skipped", "reason": "no transcript"}
+        if not call.transcript:
+            # Persist the downloaded text so the Call Log dialog can show
+            # the conversation even when the webhook carried no turns.
+            call.transcript = [{"role": "transcript", "content": text[:MAX_TRANSCRIPT_CHARS]}]
 
         result = await analyze_transcript(text, api_key, g.model or "gemini-3.5-flash")
         purpose = result["purpose"]

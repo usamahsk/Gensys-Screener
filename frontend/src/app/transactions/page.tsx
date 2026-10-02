@@ -508,6 +508,37 @@ export default function TransactionsPage() {
     }
   };
 
+  const [recovering, setRecovering] = useState(false);
+
+  // Re-run transcript extraction for the open call — recovers orders the
+  // webhook missed (empty tool-call items, empty transcript turns).
+  // Needs the Google key + recovery enabled in Settings.
+  const retryExtraction = async () => {
+    const c = selected?.call;
+    if (!c) return;
+    setRecovering(true);
+    try {
+      const r = await apiClient.recoverCallOrder(c.call_id);
+      if (r.status === "recovered" && r.order_number) {
+        const ost = (r as { order_status?: string }).order_status;
+        toast.success(`Recovered order ${r.order_number}${ost ? ` (${ost})` : ""}`);
+      } else {
+        toast.info(`No order recovered: ${r.reason || r.status}`);
+      }
+      // Refresh the open dialog + lists so a recovered order shows up.
+      try {
+        setCallDetail(await apiClient.callDetail(c.call_id));
+      } catch {
+        /* keep old detail */
+      }
+      load();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Recovery failed (check Google key + recovery toggle)");
+    } finally {
+      setRecovering(false);
+    }
+  };
+
   const stats = useMemo(() => {
     if (view === "calls") {
       const talk = callLogs.reduce((sum, c) => sum + (c.duration_seconds || 0), 0);
@@ -1255,6 +1286,17 @@ export default function TransactionsPage() {
 
               <div className="sticky bottom-0 flex justify-end gap-2 border-t border-[#E2E8F4] bg-background py-3">
                 <Button variant="outline" onClick={() => setSelected(null)}>Close</Button>
+                {selected.call && (
+                  <Button
+                    variant="outline"
+                    disabled={recovering}
+                    onClick={retryExtraction}
+                    title="Re-run transcript extraction for this call (recovers orders the webhook missed)"
+                  >
+                    <RefreshCw className={`mr-2 h-4 w-4 ${recovering ? "animate-spin" : ""}`} />
+                    {recovering ? "Recovering…" : "Retry extraction"}
+                  </Button>
+                )}
                 {selected.call && (
                   <Button variant="outline" onClick={openTrace}>
                     <ExternalLink className="mr-2 h-4 w-4" /> View trace
