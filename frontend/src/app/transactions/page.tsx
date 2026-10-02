@@ -224,14 +224,17 @@ function effectiveProviderId(call: TransactionCall | null, orders: OrderRow[]): 
 
 export default function TransactionsPage() {
   const [view, setView] = useState<"orders" | "calls">("orders");
-  const [sessions, setSessions] = useState<TransactionRow[]>([]);
+  // Transactions tab = orders only (order + its details).
+  const [orders, setOrders] = useState<OrderRow[]>([]);
+  const [selectedOrder, setSelectedOrder] = useState<OrderDetail | null>(null);
+  const [orderLoading, setOrderLoading] = useState(false);
+  // Call Logs tab = call logs with full mapped detail.
   const [callLogs, setCallLogs] = useState<import("@/lib/api").CallRow[]>([]);
   const [search, setSearch] = useState("");
   const [disposition, setDisposition] = useState("all");
   const [purpose, setPurpose] = useState("all");
   const [orderStatus, setOrderStatus] = useState("all");
-  const [linkedOnly, setLinkedOnly] = useState(true);
-  const [providerOnly, setProviderOnly] = useState(true);
+  const [providerOnly, setProviderOnly] = useState(false);
   const [runOnly, setRunOnly] = useState(false);
   const [page, setPage] = useState(1);
   const [loading, setLoading] = useState(false);
@@ -258,16 +261,11 @@ export default function TransactionsPage() {
         setCallLogs(rows);
         setError("");
       } else {
-        const data = await apiClient.transactions({
-          disposition: disposition === "all" ? undefined : disposition,
-          purpose: purpose === "all" ? undefined : purpose,
-          order_status: orderStatus === "all" ? undefined : orderStatus,
+        const rows = await apiClient.orders({
+          status: orderStatus === "all" ? undefined : orderStatus,
           search: search.trim() || undefined,
-          linked_only: linkedOnly || undefined,
-          has_provider_id: providerOnly || undefined,
-          has_run: runOnly || undefined,
         });
-        setSessions(data.transactions);
+        setOrders(rows);
         setError("");
       }
     } catch (e) {
@@ -275,7 +273,7 @@ export default function TransactionsPage() {
     } finally {
       setLoading(false);
     }
-  }, [view, disposition, purpose, orderStatus, search, linkedOnly, providerOnly, runOnly]);
+  }, [view, disposition, purpose, orderStatus, search, providerOnly, runOnly]);
 
   useEffect(() => {
     const t = setTimeout(load, search ? 400 : 0);
@@ -284,7 +282,7 @@ export default function TransactionsPage() {
 
   useEffect(() => {
     setPage(1);
-  }, [view, disposition, purpose, orderStatus, search, linkedOnly, providerOnly, runOnly]);
+  }, [view, disposition, purpose, orderStatus, search, providerOnly, runOnly]);
 
   const backfill = async () => {
     setBackfilling(true);
@@ -308,14 +306,90 @@ export default function TransactionsPage() {
     }
   };
 
-  const rows = view === "calls" ? callLogs : sessions;
+  const rows = view === "calls" ? callLogs : orders;
   const totalPages = Math.max(1, Math.ceil(rows.length / PAGE_SIZE));
   const safePage = Math.min(page, totalPages);
-  const paged = view === "calls"
-    ? []
-    : (sessions as TransactionRow[]).slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+  const pagedOrders = (orders as OrderRow[]).slice(
+    (safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
   const pagedCalls = (callLogs as import("@/lib/api").CallRow[]).slice(
     (safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE);
+
+  // Open one order (Transactions tab): order + its details only.
+  const openOrder = async (orderNumber: string) => {
+    setOrderLoading(true);
+    try {
+      setSelectedOrder(await apiClient.orderDetail(orderNumber));
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Could not load order");
+    } finally {
+      setOrderLoading(false);
+    }
+  };
+
+  // From an order's linked run → switch to Call Logs and open that run's
+  // call with intent, provider, tools, initial/gathered context and all.
+  const jumpToLinkedCall = async (callId: string) => {
+    if (!callId.trim()) {
+      toast.error("This order has no linked call yet");
+      return;
+    }
+    setSelectedOrder(null);
+    setView("calls");
+    setDetailLoading(true);
+    try {
+      const detail = await apiClient.callDetail(callId.trim());
+      const pseudo: TransactionRow = {
+        key: `call:${detail.call_id}`,
+        started_at: detail.started_at,
+        call: {
+          call_id: detail.call_id,
+          call_type: detail.call_type,
+          call_purpose: detail.call_purpose,
+          disposition: detail.disposition,
+          started_at: detail.started_at,
+          duration_seconds: detail.duration_seconds,
+          customer_name: detail.customer_name,
+          customer_phone: detail.customer_phone,
+          first_name: detail.first_name,
+          rsvp: detail.rsvp,
+          summary: detail.summary,
+          escalation_reason: detail.escalation_reason,
+          order_numbers: detail.order_numbers,
+          sentiment: detail.sentiment,
+          recording_url: detail.recording_url,
+          transcript_url: detail.transcript_url,
+          provider: detail.provider,
+          provider_call_id: detail.provider_call_id,
+          genesys_conversation_id: detail.genesys_conversation_id,
+          run_id: detail.run_id,
+          workflow_id: detail.workflow_id,
+          workflow_name: detail.workflow_name,
+          customer_intent: detail.customer_intent,
+          initial_context: detail.initial_context,
+          gathered_context: detail.gathered_context,
+        },
+        orders: [],
+      };
+      setSelected(pseudo);
+      setCallDetail(detail);
+      setOrderDetails([]);
+      setRunEvidence(null);
+      const ods: OrderDetail[] = [];
+      for (const n of detail.order_numbers || []) {
+        try {
+          ods.push(await apiClient.orderDetail(n));
+        } catch {
+          /* summary row is enough */
+        }
+      }
+      setOrderDetails(ods);
+      await loadRunEvidence(pseudo);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Linked call not found");
+    } finally {
+      setDetailLoading(false);
+    }
+  };
 
   const openCallLog = async (c: import("@/lib/api").CallRow) => {
     const pseudo: TransactionRow = {
@@ -444,14 +518,14 @@ export default function TransactionsPage() {
         { label: "Talk time", value: fmtDuration(talk), icon: Clock },
       ];
     }
-    const withOrders = sessions.filter((s) => s.orders.length > 0).length;
-    const talk = sessions.reduce((sum, s) => sum + (s.call?.duration_seconds || 0), 0);
+    const revenue = orders.reduce((sum, o) => sum + (Number(o.total) || 0), 0);
+    const items = orders.reduce((sum, o) => sum + (o.item_count || 0), 0);
     return [
-      { label: "Linked transactions", value: sessions.length, icon: Layers },
-      { label: "With orders", value: withOrders, icon: ShoppingCart },
-      { label: "Talk time", value: fmtDuration(talk), icon: Clock },
+      { label: "Total orders", value: orders.length, icon: ShoppingCart },
+      { label: "Items ordered", value: items, icon: Layers },
+      { label: "Order revenue", value: fmtMoney(revenue), icon: Clock },
     ];
-  }, [sessions, callLogs, view]);
+  }, [orders, callLogs, view]);
 
   const chain = selected
     ? {
@@ -577,17 +651,19 @@ export default function TransactionsPage() {
             ))}
           </SelectContent>
         </Select>
-        <Select value={purpose} onValueChange={setPurpose}>
-          <SelectTrigger className="w-48">
-            <SelectValue placeholder="All purposes" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="all">All purposes</SelectItem>
-            {PURPOSES.map((p) => (
-              <SelectItem key={p} value={p}>{p.replace("_", " ")}</SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
+        {view === "calls" && (
+          <Select value={purpose} onValueChange={setPurpose}>
+            <SelectTrigger className="w-48">
+              <SelectValue placeholder="All purposes" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All purposes</SelectItem>
+              {PURPOSES.map((p) => (
+                <SelectItem key={p} value={p}>{p.replace("_", " ")}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
         {view === "orders" && (
           <Select value={orderStatus} onValueChange={setOrderStatus}>
             <SelectTrigger className="w-48">
@@ -601,27 +677,27 @@ export default function TransactionsPage() {
             </SelectContent>
           </Select>
         )}
-        <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
-          <input type="checkbox" checked={linkedOnly} onChange={(e) => setLinkedOnly(e.target.checked)} disabled={view === "calls"} />
-          Linked orders only
-        </label>
-        <label className="flex items-center gap-1.5 text-xs text-muted-foreground" title="Only rows with a Dograh run-linked provider ID / Genesys conversation ID">
-          <input type="checkbox" checked={providerOnly} onChange={(e) => setProviderOnly(e.target.checked)} />
-          Has provider ID
-        </label>
-        <label className="flex items-center gap-1.5 text-xs text-muted-foreground" title="Only rows linked to a Dograh run ID">
-          <input type="checkbox" checked={runOnly} onChange={(e) => setRunOnly(e.target.checked)} />
-          Has run ID
-        </label>
+        {view === "calls" && (
+          <>
+            <label className="flex items-center gap-1.5 text-xs text-muted-foreground" title="Only rows with a provider/telephone id or Genesys conversation id">
+              <input type="checkbox" checked={providerOnly} onChange={(e) => setProviderOnly(e.target.checked)} />
+              Has provider ID
+            </label>
+            <label className="flex items-center gap-1.5 text-xs text-muted-foreground" title="Only rows linked to a Dograh run ID">
+              <input type="checkbox" checked={runOnly} onChange={(e) => setRunOnly(e.target.checked)} />
+              Has run ID
+            </label>
+          </>
+        )}
         <span className="text-sm text-muted-foreground">
-          {view === "calls" ? `${callLogs.length} call logs` : `${sessions.length} linked transactions`}
+          {view === "calls" ? `${callLogs.length} call logs` : `${orders.length} orders`}
         </span>
       </div>
 
       <div className="text-xs text-muted-foreground">
         {view === "orders"
-          ? "Transactions = only orders linked with a Dograh run ID + Genesys conversation / provider ID."
-          : "Call Logs = every call with provider, initial + gathered context, customer intent, recordings, transcripts and tool calls."}
+          ? "Transactions = orders only — customer, items, total, status. Open an order, then follow its linked run into Call Logs."
+          : "Call Logs = every call with provider, customer intent, initial + gathered context, recordings, transcripts and tool calls."}
       </div>
 
       {error && <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>}
@@ -703,87 +779,69 @@ export default function TransactionsPage() {
       )}
       {view === "orders" && (
       <div className="card-clean overflow-x-auto">
-        <Table className="min-w-[760px]">
+        <Table className="min-w-[900px]">
           <TableHeader>
             <TableRow>
-              <TableHead>Transaction</TableHead>
+              <TableHead>Order</TableHead>
               <TableHead>Customer</TableHead>
-              <TableHead>Provider</TableHead>
-              <TableHead>Provider ID</TableHead>
+              <TableHead className="text-right">Items</TableHead>
+              <TableHead className="text-right">Total</TableHead>
               <TableHead>Status</TableHead>
-              <TableHead>Orders</TableHead>
-              <TableHead>Duration</TableHead>
+              <TableHead>Type</TableHead>
+              <TableHead>Linked run</TableHead>
               <TableHead>When</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {paged.map((s) => (
-              <TableRow key={s.key} className="cursor-pointer hover:bg-[#F5F8FD]" onClick={() => openSession(s)}>
-                <TableCell className="max-w-[150px] truncate font-mono text-xs font-semibold" title={s.call?.call_id || s.orders[0]?.order_number || s.key}>
-                  {s.call ? s.call.call_id.slice(0, 18) : s.orders[0]?.order_number || "—"}
-                  {s.call?.run_id ? <div className="font-normal text-muted-foreground">run #{s.call.run_id}</div> : null}
+            {pagedOrders.map((o) => (
+              <TableRow key={o.order_number} className="cursor-pointer hover:bg-[#F5F8FD]" onClick={() => openOrder(o.order_number)}>
+                <TableCell className="font-mono text-xs font-semibold" title={o.order_number}>
+                  {o.order_number}
+                  <div className="font-normal text-muted-foreground">{o.source || "voice_agent"}</div>
                 </TableCell>
                 <TableCell>
                   <div className="flex items-center gap-1.5 text-sm">
                     <User className="h-3.5 w-3.5 text-muted-foreground" />
-                    {s.call?.customer_name || s.call?.first_name || s.orders[0]?.customer_name || "—"}
+                    {o.customer_name || "—"}
                   </div>
-                  <div className="text-xs text-muted-foreground">
-                    {s.call?.customer_phone || s.orders[0]?.customer_phone || "—"}
-                  </div>
+                  <div className="text-xs text-muted-foreground">{o.customer_phone || "—"}</div>
                 </TableCell>
+                <TableCell className="text-right text-sm font-medium">{o.item_count}</TableCell>
+                <TableCell className="text-right text-sm font-bold">{fmtMoney(o.total)}</TableCell>
                 <TableCell>
-                  <Badge variant="outline" className="text-[11px]">
-                    {s.call?.provider || s.orders[0]?.provider || "dograh"}
+                  <Badge variant="secondary" className={`${statusClass(o.status)} hover:${statusClass(o.status)}`}>
+                    {o.status.replace("_", " ")}
                   </Badge>
                 </TableCell>
-                <TableCell className="max-w-[140px] truncate font-mono text-[11px]" title={effectiveProviderId(s.call, s.orders)}>
-                  {effectiveProviderId(s.call, s.orders) || "—"}
-                </TableCell>
+                <TableCell className="text-xs capitalize">{o.order_type || "—"}</TableCell>
                 <TableCell>
-                  <div className="flex flex-col items-start gap-1">
-                    {s.call ? (
-                      <>
-                        <CallPurposeBadge type={s.call.call_type} purpose={s.call.call_purpose} />
-                        <DispositionBadge disposition={s.call.disposition} />
-                      </>
-                    ) : (
-                      s.orders.map((o) => (
-                        <Badge key={o.order_number} variant="secondary" className={`${statusClass(o.status)} hover:${statusClass(o.status)}`}>
-                          {o.status.replace("_", " ")}
-                        </Badge>
-                      ))
-                    )}
-                  </div>
-                </TableCell>
-                <TableCell>
-                  {s.orders.length > 0 ? (
-                    <div className="flex flex-wrap gap-1">
-                      {s.orders.map((o) => (
-                        <Badge key={o.order_number} variant="outline" className="font-mono text-[11px]">
-                          {o.order_number}
-                        </Badge>
-                      ))}
-                    </div>
+                  {o.call_id || o.run_id ? (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="font-mono text-[11px]"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        jumpToLinkedCall(o.call_id);
+                      }}
+                      title={o.provider_call_id || o.genesys_conversation_id || o.call_id}
+                    >
+                      <ExternalLink className="mr-1 h-3 w-3" />
+                      {o.run_id ? `run #${o.run_id}` : o.call_id.slice(0, 12)}
+                    </Button>
                   ) : (
                     <span className="text-xs text-muted-foreground">—</span>
                   )}
                 </TableCell>
-                <TableCell>
-                  <span className="flex items-center gap-1 text-sm">
-                    <Clock className="h-3.5 w-3.5 text-muted-foreground" />
-                    {fmtDuration(s.call?.duration_seconds || 0)}
-                  </span>
-                </TableCell>
                 <TableCell className="whitespace-nowrap text-xs text-muted-foreground">
-                  {s.started_at ? fmtDateTime(s.started_at) : "—"}
+                  {o.created_at ? fmtDateTime(o.created_at) : "—"}
                 </TableCell>
               </TableRow>
             ))}
-            {sessions.length === 0 && !error && (
+            {orders.length === 0 && !error && (
               <TableRow>
                 <TableCell colSpan={8} className="py-8 text-center text-muted-foreground">
-                  {loading ? "Loading transactions…" : "No transactions yet."}
+                  {loading ? "Loading orders…" : "No orders yet."}
                 </TableCell>
               </TableRow>
             )}
@@ -792,6 +850,123 @@ export default function TransactionsPage() {
       </div>
       )}
       <Pagination page={safePage} totalPages={totalPages} onChange={setPage} />
+
+      {/* Order dialog — order + its details only */}
+      <Dialog open={!!selectedOrder} onOpenChange={(open) => !open && setSelectedOrder(null)}>
+        <DialogContent className="max-h-[90vh] w-[calc(100vw-2rem)] max-w-2xl overflow-y-auto">
+          {selectedOrder && (
+            <div className="grid gap-4">
+              <DialogHeader>
+                <DialogTitle className="flex flex-wrap items-center gap-2 pr-10">
+                  <ShoppingCart className="h-4 w-4 text-[#0068FF]" />
+                  <span className="font-mono text-sm">{selectedOrder.order_number}</span>
+                  <Badge variant="secondary" className={`${statusClass(selectedOrder.status)} hover:${statusClass(selectedOrder.status)}`}>
+                    {selectedOrder.status.replace("_", " ")}
+                  </Badge>
+                  <span className="ml-auto text-sm font-bold">{fmtMoney(selectedOrder.total)}</span>
+                </DialogTitle>
+              </DialogHeader>
+
+              {orderLoading && <div className="text-sm text-muted-foreground">Loading order…</div>}
+
+              <div className="rounded-xl border border-[#E2E8F4] p-3">
+                <div className="flex items-center gap-1.5 text-sm font-medium">
+                  <User className="h-3.5 w-3.5 text-muted-foreground" />
+                  {selectedOrder.customer_name || "Unknown"}
+                </div>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  {selectedOrder.customer_phone || "—"}
+                  {selectedOrder.email ? ` · ${selectedOrder.email}` : ""}
+                </div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  <span className="capitalize">{selectedOrder.order_type}</span>
+                  {selectedOrder.table_number ? ` · table ${selectedOrder.table_number}` : ""}
+                  {selectedOrder.pickup_time ? ` · pickup ${selectedOrder.pickup_time}` : ""}
+                  {selectedOrder.payment_method ? ` · ${selectedOrder.payment_method}` : ""}
+                </div>
+                {selectedOrder.delivery_address && (
+                  <div className="mt-1 text-xs text-muted-foreground">Deliver: {selectedOrder.delivery_address}</div>
+                )}
+              </div>
+
+              <div className="rounded-xl border border-[#E2E8F4] p-3">
+                <div className="mb-2 text-xs font-semibold text-muted-foreground">
+                  ITEMS ({selectedOrder.items.reduce((s, i) => s + i.quantity, 0)} total)
+                </div>
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Item</TableHead>
+                      <TableHead>Qty</TableHead>
+                      <TableHead className="text-right">Price</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {selectedOrder.items.map((i, idx) => (
+                      <TableRow key={idx}>
+                        <TableCell className="text-sm">
+                          {i.name}
+                          {i.size ? <span className="text-muted-foreground"> ({i.size})</span> : null}
+                          {i.notes ? <div className="text-xs text-muted-foreground">{i.notes}</div> : null}
+                        </TableCell>
+                        <TableCell className="text-sm">{i.quantity}</TableCell>
+                        <TableCell className="text-right text-sm">{fmtMoney(Number(i.unit_price) * i.quantity)}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+
+              {selectedOrder.events.length > 0 && (
+                <div className="rounded-xl border border-[#E2E8F4] p-3">
+                  <div className="mb-2 text-xs font-semibold text-muted-foreground">TIMELINE</div>
+                  <ol className="space-y-1 border-l border-l-[#E2E8F4] pl-4">
+                    {selectedOrder.events.map((e, idx) => (
+                      <li key={idx} className="relative text-xs">
+                        <span className="absolute -left-[21px] top-1 h-2 w-2 rounded-full bg-primary" />
+                        <span className="font-medium capitalize">{e.status.replace("_", " ")}</span>
+                        {e.note ? <span className="ml-2 text-muted-foreground">{e.note}</span> : null}
+                        <span className="ml-2 text-muted-foreground">{fmtDateTime(e.created_at)}</span>
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+              )}
+
+              <div className="rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3">
+                <div className="mb-1 text-xs font-semibold text-muted-foreground">LINKED RUN</div>
+                {selectedOrder.call_id || selectedOrder.run_id ? (
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    <Badge variant="outline">{selectedOrder.provider || "dograh"}</Badge>
+                    {(selectedOrder.provider_call_id || selectedOrder.genesys_conversation_id) && (
+                      <span className="break-all font-mono text-[11px]">
+                        {selectedOrder.provider_call_id || selectedOrder.genesys_conversation_id}
+                      </span>
+                    )}
+                    {selectedOrder.run_id && (
+                      <span className="font-mono text-[11px] text-muted-foreground">run #{selectedOrder.run_id}</span>
+                    )}
+                    <Button size="sm" onClick={() => jumpToLinkedCall(selectedOrder.call_id)}>
+                      <ExternalLink className="mr-1 h-3 w-3" /> Open in Call Logs
+                    </Button>
+                  </div>
+                ) : (
+                  <div className="text-xs text-muted-foreground">No linked call for this order.</div>
+                )}
+              </div>
+
+              <div className="sticky bottom-0 flex justify-end gap-2 border-t border-[#E2E8F4] bg-background py-3">
+                <Button variant="outline" onClick={() => setSelectedOrder(null)}>Close</Button>
+                {(selectedOrder.call_id || selectedOrder.run_id) && (
+                  <Button onClick={() => jumpToLinkedCall(selectedOrder.call_id)}>
+                    <ExternalLink className="mr-2 h-4 w-4" /> Open linked run
+                  </Button>
+                )}
+              </div>
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={!!selected} onOpenChange={(open) => !open && setSelected(null)}>
         <DialogContent className="max-h-[90vh] w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)] overflow-y-auto overflow-x-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden sm:w-[90vw] sm:max-w-[90vw]">

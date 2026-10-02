@@ -48,6 +48,12 @@ export interface OrderRow {
   provider: string;
   provider_call_id: string;
   call_id: string;
+  run_id?: number | null;
+  workflow_id?: number | null;
+  workflow_name?: string;
+  genesys_conversation_id?: string;
+  customer_intent?: string;
+  call_purpose?: string;
 }
 
 export interface OrderDetail extends OrderRow {
@@ -55,6 +61,16 @@ export interface OrderDetail extends OrderRow {
   call_id: string;
   items: OrderItem[];
   events: OrderEvent[];
+  linked_call?: {
+    call_id: string;
+    provider: string;
+    provider_call_id: string;
+    genesys_conversation_id: string;
+    run_id: number | null;
+    workflow_id: number | null;
+    call_purpose: string;
+    customer_intent: string;
+  } | null;
 }
 
 export interface CallRow {
@@ -220,7 +236,7 @@ export interface Analytics {
 
 export const apiClient = {
   analytics: () => api<Analytics>("/api/analytics/summary"),
-  orders: (params?: { status?: string; search?: string; order_type?: string; source?: string; exclude_incomplete?: boolean }) => {
+  orders: (params?: { status?: string; search?: string; order_type?: string; source?: string; exclude_incomplete?: boolean; has_provider_id?: boolean; has_run?: boolean }) => {
     const qs = new URLSearchParams(
       Object.entries(params || {}).filter(([, v]) => v !== undefined && v !== "" && v !== false) as [string, string][]
     );
