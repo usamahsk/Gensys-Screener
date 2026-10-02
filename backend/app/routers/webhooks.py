@@ -57,9 +57,15 @@ async def call_ended(
             existing.disposition = "transferred"
             updated_fields.append("disposition")
         incoming_reason = (payload.transfer_reason or "").strip()
-        if incoming_reason and not (existing.escalation_reason or "").strip():
-            existing.escalation_reason = incoming_reason
-            updated_fields.append("escalation_reason")
+        if not (existing.escalation_reason or "").strip():
+            reason_fill = incoming_reason or (
+                _infer_transfer_reason(payload.transcript or existing.transcript,
+                                       payload.tool_calls or existing.tool_calls)
+                if incoming_disposition == "transferred" else ""
+            )
+            if reason_fill:
+                existing.escalation_reason = reason_fill[:512]
+                updated_fields.append("escalation_reason")
         if payload.transcript and not (existing.transcript or []):
             existing.transcript = payload.transcript
             updated_fields.append("transcript")
@@ -214,7 +220,8 @@ async def call_ended(
         tool_calls=payload.tool_calls,
         order_numbers=order_numbers,
         summary=summary,
-        escalation_reason=payload.transfer_reason or "",
+        escalation_reason=payload.transfer_reason
+        or _infer_transfer_reason(payload.transcript, payload.tool_calls),
         sentiment=payload.sentiment or "",
         cost=payload.cost if payload.cost is not None else (
             round(duration * 0.0032, 4) if duration else None
@@ -465,13 +472,43 @@ async def _run_transcript_extraction(
 
 def _payload_text(p: CallEndedWebhook) -> str:
     """Flat transcript text for keyword fallbacks (purpose classification)."""
-    parts: list[str] = []
-    for t in p.transcript or []:
+    return _turns_text(p.transcript)
+
+
+_TRANSFER_PHRASES = (
+    "transfer", "xfer", "escalat", "handoff", "hand off",
+    "connect you with", "connecting you", "put you through",
+    "human agent", "real person", "live agent",
+    "someone who can assist", "someone who can help",
+    "supervisor", "manager",
+)
+
+
+def _infer_transfer_reason(transcript: Any, tool_calls: Any) -> str:
+    """Evidence-based handoff reason when the webhook carried none.
+
+    A blanket-wired /transfer hook (or a reason-less call-ended) leaves
+    transferred rows with no reason; the transcript/tools usually still show
+    the handoff ("please hold while I connect you with someone..."). Returns
+    "" when there is no transfer evidence at all.
+    """
+    for t in tool_calls or []:
+        if not isinstance(t, dict):
+            continue
+        blob = f"{t.get('name', '')} {t.get('args_summary', '')} {t.get('result', '')}"
+        if any(k in blob.lower() for k in ("transfer", "xfer", "escalat", "handoff")):
+            s = str(t.get("args_summary") or t.get("result") or "").strip()
+            name = str(t.get("name") or "tool").strip()
+            return f"Handoff ({name}): {s[:200]}".strip() if s else f"Handoff via {name}"
+    for t in transcript or []:
         if isinstance(t, dict):
-            c = t.get("content") or t.get("text") or ""
-            if c:
-                parts.append(f"{t.get('role', 'unknown')}: {c}")
-    return "\n".join(parts)
+            c = str(t.get("content") or t.get("text") or "")
+        else:
+            c = str(t or "")
+        if any(k in c.lower() for k in _TRANSFER_PHRASES):
+            snippet = " ".join(c.split())[:200]
+            return f"Handoff detected in transcript: {snippet}" if snippet else "Handoff detected in transcript"
+    return ""
 
 
 def _parse_items(order_items: Any) -> list[dict]:
@@ -516,6 +553,12 @@ async def transfer(payload: TransferWebhook, db: AsyncSession = Depends(get_db))
 
     The response's agent_context is what the human agent reads to continue
     the call without making the caller repeat themselves.
+
+    Empty-reason hits are ignored (recorded=False, no disposition change):
+    this URL must be wired to the escalation branch only — a global
+    post-call hook that fires it on every call would otherwise mark every
+    call transferred. Real escalations always carry a reason; alternatively
+    send call-ended with disposition=transfer + transfer_reason instead.
     """
     call_id = payload.resolved_call_id()
     if not call_id:
@@ -523,6 +566,13 @@ async def transfer(payload: TransferWebhook, db: AsyncSession = Depends(get_db))
     reason = payload.resolved_reason()
     customer_name = payload.resolved_customer_name()
     customer_phone = payload.resolved_customer_phone()
+    if not reason:
+        logger.warning(
+            f"POST /api/webhooks/transfer ignored (empty reason) | call_id={call_id!r} — "
+            "wire this URL to the escalation branch only, or use call-ended "
+            "with disposition=transfer instead")
+        return TransferContextResponse(call_id=call_id, recorded=False,
+                                       agent_context={"reason_for_transfer": ""})
     call = (
         await db.execute(select(Call).where(Call.call_id == call_id))
     ).scalar_one_or_none()

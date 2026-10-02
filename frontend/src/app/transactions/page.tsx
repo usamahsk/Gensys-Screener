@@ -32,7 +32,7 @@ import {
   type TransactionCall,
   type TransactionRow,
 } from "@/lib/api";
-import { ChatTranscript, parseRawTranscript } from "@/components/chat-transcript";
+import { ChatTranscript, normalizeTurns, parseRawTranscript } from "@/components/chat-transcript";
 import { PageHeader } from "@/components/page-header";
 import { DispositionBadge } from "@/app/page";
 import { toast } from "sonner";
@@ -578,12 +578,15 @@ export default function TransactionsPage() {
     callDetail?.bot_recording_url ||
     "";
   // Conversation: saved turns first, run transcript text as fallback.
-  const turns =
+  // normalizeTurns expands blob turns with inline [ts] markers so the
+  // bubble count is real turns, not "1 turns".
+  const turns = normalizeTurns(
     callDetail && callDetail.transcript.length > 0
       ? callDetail.transcript
       : runEvidence?.transcript
         ? parseRawTranscript(runEvidence.transcript)
-        : [];
+        : []
+  );
   // Tool calls: full args/result from the Dograh run when linked, else the
   // saved tool-call log.
   const savedTools = (callDetail?.tool_calls || []).map((t) => ({
@@ -615,12 +618,28 @@ export default function TransactionsPage() {
       <PageHeader
         icon={ClipboardList}
         title="Transactions & Call Logs"
-        description="Transactions = only orders linked with a Dograh run + Genesys / provider ID. Call Logs = full call detail mapped with provider, contexts, intent, recordings, transcripts and tool calls."
+        description="Transactions = orders only — open one, follow its linked run into Call Logs. Call Logs = full call detail with intent, contexts, recordings, transcripts and tool calls."
         actions={
           <div className="flex items-center gap-2">
             <Button variant="outline" size="sm" onClick={backfill} disabled={backfilling} title="Fill empty Provider IDs and missing customer details on old rows from run details">
               <Database className={`mr-2 h-4 w-4 ${backfilling ? "animate-pulse" : ""}`} />
               {backfilling ? "Backfilling…" : "Backfill missing data"}
+            </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={async () => {
+                try {
+                  const r = await apiClient.repairDispositions();
+                  toast.success(`Checked ${r.scanned} transferred calls: kept ${r.kept_transferred}, fixed ${r.fixed_to_completed} to completed`);
+                  load();
+                } catch (e) {
+                  toast.error(e instanceof Error ? e.message : "Repair failed");
+                }
+              }}
+              title="Fix blanket-transfer damage: transferred calls with no reason and no handoff evidence go back to completed; real handoffs keep their reason"
+            >
+              Fix transfer tags
             </Button>
             <Button variant="outline" size="sm" onClick={load} disabled={loading}>
               <RefreshCw className={`mr-2 h-4 w-4 ${loading ? "animate-spin" : ""}`} /> Refresh

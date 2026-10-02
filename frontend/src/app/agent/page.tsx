@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { DispositionBadge } from "@/app/page";
 import { PageHeader } from "@/components/page-header";
-import { ChatTranscript } from "@/components/chat-transcript";
+import { ChatTranscript, normalizeTurns } from "@/components/chat-transcript";
 import { FileText, Headset, RefreshCw, ShoppingCart, User, Volume2 } from "lucide-react";
 
 /**
@@ -68,7 +68,7 @@ export default function AgentViewPage() {
 
   const summary = detail?.summary || selected?.summary || "";
   const escalationReason = detail?.escalation_reason || selected?.escalation_reason || "";
-  const transcript = detail?.transcript || [];
+  const transcript = normalizeTurns(detail?.transcript || []);
   const toolCalls = detail?.tool_calls || [];
 
   return (

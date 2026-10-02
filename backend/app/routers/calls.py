@@ -99,6 +99,36 @@ async def list_calls(
     ]
 
 
+@router.post("/repair-dispositions", response_model=dict)
+async def repair_dispositions(db: AsyncSession = Depends(get_db)):
+    """Repair blanket-transfer damage: `transferred` rows with no reason.
+
+    - Real handoffs (transfer evidence in tools/transcript) stay transferred
+      and get the inferred reason filled in.
+    - Rows with no transfer evidence at all go back to `completed`.
+    Returns {scanned, kept_transferred, fixed_to_completed}.
+    """
+    from app.routers.webhooks import _infer_transfer_reason
+
+    rows = (await db.execute(
+        select(Call).where(Call.disposition == "transferred"))).scalars().all()
+    kept, fixed = 0, 0
+    for c in rows:
+        if (c.escalation_reason or "").strip():
+            kept += 1
+            continue
+        reason = _infer_transfer_reason(c.transcript, c.tool_calls)
+        if reason:
+            c.escalation_reason = reason[:512]
+            kept += 1
+        else:
+            c.disposition = "completed"
+            fixed += 1
+    await db.commit()
+    return {"scanned": len(rows), "kept_transferred": kept,
+            "fixed_to_completed": fixed}
+
+
 @router.get("/{call_id}")
 async def call_detail(call_id: str, db: AsyncSession = Depends(get_db)):
     from app.models import Customer as _Customer

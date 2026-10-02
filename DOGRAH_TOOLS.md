@@ -273,6 +273,14 @@ number so numbering stays sequential (total count + 1).
 
 ## Post-call webhooks (not agent tools — configure in Dograh's post-call/webhook hook, or trigger at call end)
 
+> **Recommended setup: ONE webhook — `call-ended`.** Its `disposition`
+> field routes the call automatically: `completed` | `transferred` (any of
+> transfer / transferred / escalated / handoff-to-agent) | `failed` |
+> `abandoned`. A `transferred` disposition needs `transfer_reason` (or
+> transfer language in the transcript/tools — the reason is inferred).
+> `/transfer` below is optional, for pinning a mid-call handoff in Agent
+> View before the call ends — never wire it to a global hook.
+
 **Call ended** — `POST <BASE>/api/webhooks/call-ended`
 ```json
 {
@@ -325,6 +333,14 @@ number so numbering stays sequential (total count + 1).
 ```
 Response includes `agent_context` — the summary + customer + last order that the
 human agent sees on the dashboard's Agent View.
+
+> **Wire this to the escalation branch ONLY — never to a global post-call
+> hook.** It flips the call to `transferred`; firing it on every call marks
+> every call transferred (Agent View fills with non-escalations, and
+> `call-ended` cannot flip it back). Hits with an empty `reason` are now
+> ignored (`recorded: false`). If your setup can only fire one webhook,
+> skip this URL and send `call-ended` with `"disposition": "transfer"` plus
+> `transfer_reason` instead — same Agent View result.
 
 > **Transfer from the Dograh side:** when the voice agent transfers, the call
 > ends with a transfer status — send `POST <BASE>/api/webhooks/call-ended`

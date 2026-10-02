@@ -339,6 +339,11 @@ export const apiClient = {
       "/api/transactions/backfill-purposes",
       { method: "POST" }
     ),
+  repairDispositions: () =>
+    api<{ scanned: number; kept_transferred: number; fixed_to_completed: number }>(
+      "/api/calls/repair-dispositions",
+      { method: "POST" }
+    ),
   telephonyProviders: () =>
     api<{ providers: TelephonyProviderMeta[] }>(
       "/api/integration/dograh/telephony/providers"
