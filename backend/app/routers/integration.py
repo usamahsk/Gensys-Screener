@@ -479,15 +479,25 @@ def _extract_telephony(detail: dict) -> dict:
         scopes.append(_audiohook)
     scopes.append(detail if isinstance(detail, dict) else {})
 
-    provider_call_id = ""
-    for scope in scopes:
-        for k in TELEPHONY_ID_KEYS:
-            v = scope.get(k)
-            if isinstance(v, str) and v.strip() and "{{" not in v:
-                provider_call_id = v.strip()[:128]
-                break
-        if provider_call_id:
-            break
+    def _scan(keys: tuple[str, ...]) -> str:
+        for k in keys:
+            for scope in scopes:
+                v = scope.get(k)
+                if isinstance(v, str) and v.strip() and "{{" not in v:
+                    return v.strip()[:128]
+        return ""
+
+    # Conversation id is the Provider ID — scan it across ALL scopes
+    # (incl. logs.audiohook) before any session/correlation id, so a
+    # session id in initial_context never beats the conversation id.
+    provider_call_id = (
+        _scan(("conversation_id", "conversationId"))
+        or _scan(tuple(k for k in TELEPHONY_ID_KEYS
+                       if k not in ("conversation_id", "conversationId",
+                                    "session_id", "correlation_id", "call_id")))
+        or _scan(("session_id", "correlation_id"))
+        or _scan(("call_id",))
+    )
 
     provider = ""
     for scope in scopes:

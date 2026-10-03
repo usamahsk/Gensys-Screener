@@ -94,17 +94,24 @@ async def _resolve_order_number(db: AsyncSession, requested: object) -> str:
 
 
 # Context keys that may carry the provider / telephony / Genesys ids inside
-# initial_context / gathered_context (Dograh run contexts). Conversation id
-# is preferred over session/correlation; see run 1678:
+# initial_context / gathered_context (Dograh run contexts). The Genesys
+# CONVERSATION id is the Provider ID — never the session id; see run 1678:
 #   session=c6608177-... conversation=81dabd1f-... provider=genesys
+# Key groups are searched in order ACROSS all scopes, so a conversation id in
+# gathered_context beats a session id in initial_context.
 _CTX_PROVIDER_KEYS = ("provider", "telephony_provider", "call_provider")
-_CTX_TELEPHONY_KEYS = (
+_CTX_CONVERSATION_KEYS = ("conversation_id", "conversationId")
+_CTX_SESSION_KEYS = ("session_id", "correlation_id")
+_CTX_OTHER_TELEPHONY_KEYS = (
     "provider_call_id", "telephony_id", "telephony_call_id", "call_sid",
     "telephony_call_sid", "twilio_sid", "twilio_call_sid", "vonage_uuid",
     "plivo_call_uuid", "telnyx_call_id", "call_uuid", "external_call_id",
     "provider_call_sid", "sip_call_id",
-    "conversation_id", "conversationId", "session_id", "correlation_id",
     "call_id",
+)
+_CTX_TELEPHONY_KEYS = (
+    *_CTX_CONVERSATION_KEYS, *_CTX_OTHER_TELEPHONY_KEYS,
+    *_CTX_SESSION_KEYS, "call_id",
 )
 _CTX_GENESYS_KEYS = (
     "conversation_id", "conversationId", "correlation_id", "session_id",
@@ -161,16 +168,27 @@ def _resolve_provider_from_contexts(
         if ctx_prov:
             prov = ctx_prov[:32]
     prov = prov or "dograh"
+    # Conversation id wins across ALL scopes before any session id is
+    # considered (a session id in initial_context must not beat a
+    # conversation id in gathered_context).
+    conv = _ctx_lookup(scopes, _CTX_CONVERSATION_KEYS)
     pid = (provider_call_id or "").strip()
     if not pid:
-        pid = _ctx_lookup(scopes, _CTX_TELEPHONY_KEYS)[:128]
-    genesys = _ctx_lookup(scopes, _CTX_GENESYS_KEYS)[:64]
-    # Genesys-flavoured alias mirrors the generic id when provider is Genesys.
+        pid = (conv or _ctx_lookup(scopes, _CTX_OTHER_TELEPHONY_KEYS)
+               or _ctx_lookup(scopes, _CTX_SESSION_KEYS)
+               or _ctx_lookup(scopes, ("call_id",)))[:128]
+    elif prov == "genesys" and conv and pid != conv:
+        # Stored session id realigned to the conversation id.
+        pid = conv
+    genesys = (conv or _ctx_lookup(scopes, _CTX_GENESYS_KEYS))[:64]
+    # Provider ID IS the conversation id: mirror both ways when Genesys.
     if prov == "genesys":
         if genesys and not pid:
             pid = genesys
         elif pid and not genesys:
             genesys = pid[:64]
+        elif pid and genesys and pid != genesys:
+            pid = genesys
     return prov[:32], pid[:128], genesys[:64]
 
 
@@ -318,9 +336,14 @@ async def _log_tool_call(
         call.provider = _rprov[:32]
     if _rgen and not (call.genesys_conversation_id or "").strip():
         call.genesys_conversation_id = _rgen[:64]
-    if call.provider == "genesys" and (call.provider_call_id or "").strip() \
-            and not (call.genesys_conversation_id or "").strip():
-        call.genesys_conversation_id = call.provider_call_id[:64]
+    if call.provider == "genesys" or _rprov == "genesys":
+        call.provider = "genesys"
+        # Session id stored earlier is realigned to the conversation id.
+        if _rgen and (call.provider_call_id or "").strip() != _rgen:
+            call.provider_call_id = _rgen[:128]
+        if (call.provider_call_id or "").strip() \
+                and not (call.genesys_conversation_id or "").strip():
+            call.genesys_conversation_id = call.provider_call_id[:64]
     stored_intent = _normalize_intent(call.customer_intent or "")
     if call_purpose and (call.call_purpose or "").strip() in ("", "general"):
         call.call_purpose = call_purpose

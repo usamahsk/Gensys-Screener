@@ -210,13 +210,12 @@ function isProviderSid(id: string) {
 }
 
 function effectiveProviderId(call: TransactionCall | null, orders: OrderRow[]): string {
-  // Only real provider ids from the run's context: stored provider id,
-  // Genesys conversation, or a session-UUID-like call_id. Never the
-  // numeric Dograh run id — that lives in the Run field. Use the
+  // Provider ID IS the Genesys conversation id (never the session id).
+  // Never the numeric Dograh run id — that lives in the Run field. Use the
   // "Backfill provider IDs" button to pull context ids into old rows.
+  if (call?.genesys_conversation_id) return call.genesys_conversation_id;
   const direct = call?.provider_call_id || orders[0]?.provider_call_id || "";
   if (direct) return direct;
-  if (call?.genesys_conversation_id) return call.genesys_conversation_id;
   const cid = (call?.call_id || "").trim();
   if (cid && !cid.startsWith("voice_") && isProviderSid(cid)) return cid;
   return "";
@@ -1056,11 +1055,7 @@ export default function TransactionsPage() {
                     <div className="text-xs text-muted-foreground">Provider ID</div>
                     <div className="break-all font-mono text-xs">{chain.providerCallId || "—"}</div>
                   </div>
-                  <div className="min-w-0">
-                    <div className="text-xs text-muted-foreground">Genesys conversation</div>
-                    <div className="break-all font-mono text-xs">{chain.genesys || "—"}</div>
-                  </div>
-                  <div className="min-w-0">
+                  <div className="min-w-0 sm:col-span-2">
                     <div className="text-xs text-muted-foreground">Duration</div>
                     <div className="text-xs">{fmtDuration(selected.call?.duration_seconds || 0)}</div>
                   </div>

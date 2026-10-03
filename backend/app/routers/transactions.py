@@ -262,7 +262,10 @@ async def backfill_provider_ids(db: AsyncSession = Depends(get_db)):
     runs_scanned = 0
     for c in all_calls:
         need_customer = not (c.customer_phone or "").strip() or not (c.customer_name or "").strip()
-        if c.provider_call_id and not need_customer:
+        # A Genesys row whose Provider ID is the session id (not the
+        # conversation id) still needs one run-detail pass to realign it.
+        need_realign = (c.provider or "") == "genesys" and not (c.genesys_conversation_id or "").strip()
+        if c.provider_call_id and not need_customer and not need_realign:
             continue
         pid, prov = "", ""
         ctx_scopes: list[dict] = []
@@ -313,10 +316,31 @@ async def backfill_provider_ids(db: AsyncSession = Depends(get_db)):
             runs_scanned += 1
         elif c.call_id and not c.call_id.startswith("voice_") and _looks_like_sid(c.call_id):
             pid, prov = c.call_id.strip()[:128], c.provider or "dograh"
+        # Prefer the true conversation id over a stored session id.
+        conv = ""
+        for _scope in ctx_scopes:
+            if isinstance(_scope, dict):
+                for _k in ("conversation_id", "conversationId"):
+                    _v = _scope.get(_k)
+                    if isinstance(_v, str) and _v.strip() and "{{" not in _v:
+                        conv = _v.strip()[:64]
+                        break
+            if conv:
+                break
+        if conv:
+            if (prov or "") == "genesys" or (c.provider or "") == "genesys":
+                pid, prov = conv, "genesys"
+            c.genesys_conversation_id = conv
         if pid:
-            c.provider_call_id = pid[:128]
+            if not (c.provider_call_id or "").strip() or (
+                    conv and (c.provider_call_id or "").strip() != conv
+                    and ((c.provider or "") == "genesys" or (prov or "") == "genesys")):
+                c.provider_call_id = pid[:128]
             if prov and (not c.provider or c.provider == "dograh"):
                 c.provider = prov[:32]
+            updated_calls += 1
+        elif conv and not (c.genesys_conversation_id or "").strip():
+            c.genesys_conversation_id = conv
             updated_calls += 1
         if need_customer and ctx_scopes:
             ph = _first_ctx_value(ctx_scopes, _CTX_PHONE_KEYS)
