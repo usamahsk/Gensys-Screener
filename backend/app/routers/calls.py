@@ -117,7 +117,8 @@ async def repair_dispositions(db: AsyncSession = Depends(get_db)):
         if (c.escalation_reason or "").strip():
             kept += 1
             continue
-        reason = _infer_transfer_reason(c.transcript, c.tool_calls)
+        reason = _infer_transfer_reason(c.transcript, c.tool_calls,
+                                        c.gathered_context, c.initial_context)
         if reason:
             c.escalation_reason = reason[:512]
             kept += 1

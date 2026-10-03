@@ -60,7 +60,9 @@ async def call_ended(
         if not (existing.escalation_reason or "").strip():
             reason_fill = incoming_reason or (
                 _infer_transfer_reason(payload.transcript or existing.transcript,
-                                       payload.tool_calls or existing.tool_calls)
+                                       payload.tool_calls or existing.tool_calls,
+                                       payload.gathered_context or existing.gathered_context,
+                                       payload.initial_context or existing.initial_context)
                 if incoming_disposition == "transferred" else ""
             )
             if reason_fill:
@@ -194,10 +196,22 @@ async def call_ended(
     customer_phone = payload.resolved_customer_phone()
     provider = payload.resolved_provider()
     provider_call_id = payload.resolved_provider_call_id()
+    # Fall back to the run contexts: the HTTP tools often send empty
+    # provider fields while initial_context carries {"provider": "genesys",
+    # "conversation_id": ...} (run 1678). Reuse the tool-call resolver.
+    try:
+        from app.routers.tools import _resolve_provider_from_contexts as _ctx_prov
+        _cprov, _cpid, _cgen = _ctx_prov(
+            provider, provider_call_id,
+            payload.initial_context, payload.gathered_context)
+        provider, provider_call_id = _cprov, _cpid
+        _ctx_genesys = _cgen
+    except Exception:
+        _ctx_genesys = ""
     # Genesys id stays the canonical Genesys-flavoured column; mirror the
     # generic telephony id into it when the provider is Genesys (or when the
     # payload only carried the legacy genesys_conversation_id field).
-    genesys_id = payload.genesys_conversation_id or (
+    genesys_id = payload.genesys_conversation_id or _ctx_genesys or (
         provider_call_id if provider == "genesys" else ""
     )
     if provider == "genesys" and not provider_call_id:
@@ -205,6 +219,10 @@ async def call_ended(
 
     _purpose_text = _payload_text(payload)
     _webhook_purpose = payload.resolved_purpose(_purpose_text)
+    # Transcript ground truth wins: a status-check transcript tagged
+    # order_creation from a bare order-number echo is realigned here.
+    _webhook_purpose = _realign_purpose_with_transcript(
+        _webhook_purpose, payload.tool_calls, _purpose_text)
 
     summary = await summarize(
         payload.transcript, payload.tool_calls, disposition,
@@ -231,7 +249,8 @@ async def call_ended(
         order_numbers=order_numbers,
         summary=summary,
         escalation_reason=payload.transfer_reason
-        or _infer_transfer_reason(payload.transcript, payload.tool_calls),
+        or _infer_transfer_reason(payload.transcript, payload.tool_calls,
+                                  payload.gathered_context, payload.initial_context),
         sentiment=payload.sentiment or "",
         cost=payload.cost if payload.cost is not None else (
             round(duration * 0.0032, 4) if duration else None
@@ -530,13 +549,47 @@ _TRANSFER_PHRASES = (
 )
 
 
-def _infer_transfer_reason(transcript: Any, tool_calls: Any) -> str:
+_STATUS_TOOL_HINT = ("status", "track", "lookup")
+_STATUS_KW = ("order status", "status of my order", "status check",
+              "where is my order", "is my order", "track my order",
+              "cancel my order", "how long for my order")
+
+
+def _realign_purpose_with_transcript(purpose: str, tool_calls: Any, text: str) -> str:
+    """Transcript-first intent: tool names beat a bare order-number echo.
+
+    A status-check webhook echoes the looked-up PB-{n} as order_number, which
+    must NOT flip the call to order_creation. If any tool is a status/track/
+    lookup tool, the purpose is order_status even when creation flags are set.
+    """
+    try:
+        names = " ".join(
+            str((t.get("name", "") or t.get("tool", "")))
+            for t in (tool_calls or []) if isinstance(t, dict)
+        ).lower()
+    except Exception:
+        names = ""
+    if any(k in names for k in _STATUS_TOOL_HINT):
+        return "order_status"
+    if purpose == "order_creation" and any(k in names for k in ("transfer", "end_call")):
+        kw = (text or "").lower()
+        if any(k in kw for k in _STATUS_KW):
+            return "order_status"
+    return purpose
+
+
+def _infer_transfer_reason(transcript: Any, tool_calls: Any,
+                            gathered_context: Any = None,
+                            initial_context: Any = None) -> str:
     """Evidence-based handoff reason when the webhook carried none.
 
     A blanket-wired /transfer hook (or a reason-less call-ended) leaves
     transferred rows with no reason; the transcript/tools usually still show
     the handoff ("please hold while I connect you with someone..."). Returns
     "" when there is no transfer evidence at all.
+
+    Also checks run contexts for end-call transfer markers (run 1678:
+    Genesys session outputs {action: transfer, endReason: end_call_tool}).
     """
     for t in tool_calls or []:
         if not isinstance(t, dict):
@@ -546,6 +599,15 @@ def _infer_transfer_reason(transcript: Any, tool_calls: Any) -> str:
             s = str(t.get("args_summary") or t.get("result") or "").strip()
             name = str(t.get("name") or "tool").strip()
             return f"Handoff ({name}): {s[:200]}".strip() if s else f"Handoff via {name}"
+    for scope in (gathered_context or {}, initial_context or {}):
+        if not isinstance(scope, dict):
+            continue
+        for k, v in scope.items():
+            ks, vs = str(k).strip().lower(), str(v or "").strip().lower()
+            if ks in ("action", "endaction", "end_action", "endreason",
+                       "end_reason", "outcome", "call_outcome") and any(
+                    t in vs for t in ("transfer", "xfer", "escalat", "handoff", "agent")):
+                return f"Handoff ({k}={v})".strip()[:512]
     for t in transcript or []:
         if isinstance(t, dict):
             c = str(t.get("content") or t.get("text") or "")

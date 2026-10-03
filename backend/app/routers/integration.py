@@ -570,6 +570,7 @@ def _map_disposition(gc: dict) -> str:
     mapped = " ".join(str(gc.get(k) or "") for k in (
         "mapped_call_disposition", "call_disposition",
         "extracted_call_disposition", "call_outcome",
+        "action", "end_action", "endReason", "end_reason",
     )).lower()
     if "transfer" in mapped or "xfer" in mapped or "escalat" in mapped or "agent" in mapped:
         return "transferred"

@@ -853,9 +853,48 @@ class CallEndedWebhook(BaseModel):
             return self.duration
         return int(self.cost_info.get("call_duration_seconds") or 0)
 
+    def _transfer_evidence_in_contexts(self) -> str:
+        """Transfer markers inside gathered/initial contexts (Dograh end-call).
+
+        Run 1678 ended via end_call tool with Genesys session outputs
+        {action: transfer, endReason: end_call_tool} — no transfer_reason
+        field, so the row stayed 'completed'. Catch action/endReason-style
+        markers here.
+        """
+        for scope in (self.gathered_context or {}, self.initial_context or {}):
+            if not isinstance(scope, dict):
+                continue
+            for k, v in scope.items():
+                ks = str(k).strip().lower()
+                vs = str(v or "").strip().lower()
+                if ks in ("transfer_requested", "transfer_requested_reason",
+                           "transfer_reason", "reason_for_transfer",
+                           "escalation_reason", "escalated", "handoff",
+                           "handoff_requested") and vs:
+                    return str(v)[:512]
+                if ks in ("action", "endaction", "end_action", "endreason",
+                           "end_reason", "call_action", "outcome", "call_outcome",
+                           "disposition", "call_disposition",
+                           "mapped_call_disposition") and any(
+                        t in vs for t in ("transfer", "xfer", "escalat", "handoff", "agent")):
+                    return f"{k}={v}"[:512]
+                if ks in ("transfer", "transferred", "escalate") and vs not in (
+                        "", "false", "0", "no", "none", "null"):
+                    return f"{k}={v}"[:512]
+        return ""
+
     def resolved_disposition(self) -> str:
         if self.transfer_requested or self.transfer_reason:
             return "transferred"
+        if self._transfer_evidence_in_contexts():
+            return "transferred"
+        # Tool-call evidence (end_call with transfer action, transfer tool).
+        for t in self.tool_calls or []:
+            if not isinstance(t, dict):
+                continue
+            blob = f"{t.get('name', '')} {t.get('args_summary', '')} {t.get('result', '')}".lower()
+            if any(k in blob for k in ("transfer", "xfer", "escalat", "handoff")):
+                return "transferred"
         d = (self.disposition or "").strip().lower()
         # Dograh-side transfer ends the call with a transfer status — accept
         # every spelling ("Transfer", "transfer", "transferring", "transferred",

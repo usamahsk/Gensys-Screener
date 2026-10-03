@@ -93,6 +93,87 @@ async def _resolve_order_number(db: AsyncSession, requested: object) -> str:
     return await _gen_unique_order_number(db)
 
 
+# Context keys that may carry the provider / telephony / Genesys ids inside
+# initial_context / gathered_context (Dograh run contexts). Conversation id
+# is preferred over session/correlation; see run 1678:
+#   session=c6608177-... conversation=81dabd1f-... provider=genesys
+_CTX_PROVIDER_KEYS = ("provider", "telephony_provider", "call_provider")
+_CTX_TELEPHONY_KEYS = (
+    "provider_call_id", "telephony_id", "telephony_call_id", "call_sid",
+    "telephony_call_sid", "twilio_sid", "twilio_call_sid", "vonage_uuid",
+    "plivo_call_uuid", "telnyx_call_id", "call_uuid", "external_call_id",
+    "provider_call_sid", "sip_call_id",
+    "conversation_id", "conversationId", "session_id", "correlation_id",
+    "call_id",
+)
+_CTX_GENESYS_KEYS = (
+    "conversation_id", "conversationId", "correlation_id", "session_id",
+)
+
+
+def _ctx_lookup(scopes: list[dict], keys: tuple[str, ...]) -> str:
+    """First non-empty, non-template value for any key across scopes."""
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        lowered = {str(k).strip().lower(): v for k, v in scope.items()}
+        for key in keys:
+            for cand in (scope.get(key), lowered.get(key.lower())):
+                if isinstance(cand, str) and cand.strip() and "{{" not in cand:
+                    return cand.strip()
+    return ""
+
+
+def _normalize_intent(v: str) -> str:
+    """Unify intent vocab to call_purpose values (order_creation|order_status|...)."""
+    s = (v or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "order_placement": "order_creation",
+        "create_order": "order_creation",
+        "new_order": "order_creation",
+        "place_order": "order_creation",
+        "order": "order_creation",
+        "order_status_check": "order_status",
+        "status_check": "order_status",
+        "track_order": "order_status",
+        "table_booking": "reservation",
+        "book_table": "reservation",
+        "booking": "reservation",
+    }
+    s = aliases.get(s, s)
+    return s if s in ("order_creation", "order_status", "reservation", "general") else ""
+
+
+def _resolve_provider_from_contexts(
+    provider: str, provider_call_id: str,
+    initial_context: dict | None, gathered_context: dict | None,
+) -> tuple[str, str, str]:
+    """Fill provider / provider_call_id / genesys_conversation_id from contexts.
+
+    The Dograh HTTP tools often send empty provider fields even though the
+    run's initial_context carries {"provider": "genesys", "conversation_id":
+    ...}. Without this the dashboard shows Provider=dograh and empty IDs.
+    """
+    scopes = [s for s in (initial_context or {}, gathered_context or {}) if isinstance(s, dict)]
+    prov = (provider or "").strip().lower()
+    if not prov or prov == "dograh":
+        ctx_prov = _ctx_lookup(scopes, _CTX_PROVIDER_KEYS).lower()
+        if ctx_prov:
+            prov = ctx_prov[:32]
+    prov = prov or "dograh"
+    pid = (provider_call_id or "").strip()
+    if not pid:
+        pid = _ctx_lookup(scopes, _CTX_TELEPHONY_KEYS)[:128]
+    genesys = _ctx_lookup(scopes, _CTX_GENESYS_KEYS)[:64]
+    # Genesys-flavoured alias mirrors the generic id when provider is Genesys.
+    if prov == "genesys":
+        if genesys and not pid:
+            pid = genesys
+        elif pid and not genesys:
+            genesys = pid[:64]
+    return prov[:32], pid[:128], genesys[:64]
+
+
 async def _log_tool_call(
     db: AsyncSession,
     *,
@@ -137,6 +218,20 @@ async def _log_tool_call(
         duration = int(duration or 0)
     except (ValueError, TypeError):
         duration = 0
+    # Ground truth first: tool type decides purpose; incoming customer_intent
+    # is only a hint and must never override a disagreeing purpose (e.g. an
+    # order_status call tagged "order_creation" from a stale preset).
+    call_purpose = _normalize_intent(call_purpose) or call_purpose
+    norm_intent = _normalize_intent(customer_intent)
+    if call_purpose in ("order_creation", "order_status", "reservation", "general"):
+        if not norm_intent or (
+            {norm_intent, call_purpose} == {"order_creation", "order_status"}
+        ):
+            norm_intent = call_purpose
+    elif norm_intent:
+        call_purpose = call_purpose or norm_intent
+    provider, provider_call_id, _genesys = _resolve_provider_from_contexts(
+        provider, provider_call_id, initial_context, gathered_context)
     call = (
         await db.execute(select(Call).where(Call.call_id == call_id))
     ).scalar_one_or_none()
@@ -162,9 +257,10 @@ async def _log_tool_call(
             summary=tool_summary,
             provider=(provider or "dograh")[:32],
             provider_call_id=(provider_call_id or "")[:128],
+            genesys_conversation_id=_genesys or "",
             initial_context=initial_context or {},
             gathered_context=gathered_context or {},
-            customer_intent=(customer_intent or call_purpose or "")[:64],
+            customer_intent=(norm_intent or call_purpose or "")[:64],
         )
         db.add(call)
         try:
@@ -203,10 +299,6 @@ async def _log_tool_call(
         call.bot_recording_url = bot_recording_url
     if transcript_url and not call.transcript_url:
         call.transcript_url = transcript_url
-    if provider_call_id and not call.provider_call_id:
-        call.provider_call_id = provider_call_id[:128]
-    if provider and not (call.provider and call.provider != "dograh"):
-        call.provider = provider[:32]
     if initial_context:
         merged = dict(call.initial_context or {})
         merged.update(initial_context)
@@ -215,8 +307,32 @@ async def _log_tool_call(
         merged = dict(call.gathered_context or {})
         merged.update(gathered_context)
         call.gathered_context = merged
-    if customer_intent and not (call.customer_intent or "").strip():
-        call.customer_intent = customer_intent[:64]
+    # Re-resolve against the merged contexts so a later call carrying the
+    # Genesys ids backfills rows created by earlier id-less tool calls.
+    _rprov, _rpid, _rgen = _resolve_provider_from_contexts(
+        provider or call.provider or "", call.provider_call_id or provider_call_id or "",
+        call.initial_context, call.gathered_context)
+    if _rpid and not (call.provider_call_id or "").strip():
+        call.provider_call_id = _rpid[:128]
+    if _rprov and (not (call.provider or "").strip() or call.provider == "dograh"):
+        call.provider = _rprov[:32]
+    if _rgen and not (call.genesys_conversation_id or "").strip():
+        call.genesys_conversation_id = _rgen[:64]
+    if call.provider == "genesys" and (call.provider_call_id or "").strip() \
+            and not (call.genesys_conversation_id or "").strip():
+        call.genesys_conversation_id = call.provider_call_id[:64]
+    stored_intent = _normalize_intent(call.customer_intent or "")
+    if call_purpose and (call.call_purpose or "").strip() in ("", "general"):
+        call.call_purpose = call_purpose
+    # Repair stale mistags: an order_status call stored as order_creation
+    # (or vice versa) is realigned to the tool-type ground truth.
+    if call_purpose in ("order_creation", "order_status", "reservation") and stored_intent in (
+            "order_creation", "order_status", "reservation"):
+        if {stored_intent, call_purpose} == {"order_creation", "order_status"}:
+            call.customer_intent = call_purpose[:64]
+            stored_intent = call_purpose
+    if norm_intent and not stored_intent:
+        call.customer_intent = norm_intent[:64]
     elif call_purpose and not (call.customer_intent or "").strip():
         call.customer_intent = call_purpose[:64]
     if order_number and order_number not in (call.order_numbers or []):
@@ -556,8 +672,21 @@ class OrderStatusLookupRequest(BaseModel):
         return self._ctx(self.gathered_context)
 
     def resolved_customer_intent(self) -> str:
-        s = self._s(self.customer_intent)
-        return (s or "order_status_check")[:64]
+        # Canonical vocab is order_status (not order_status_check); normalize
+        # legacy values so the badge matches call_purpose.
+        s = self._s(self.customer_intent).lower().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "order_status_check": "order_status",
+            "status_check": "order_status",
+            "order_placement": "order_creation",
+            "create_order": "order_creation",
+        }
+        s = aliases.get(s, s)
+        if s not in ("order_creation", "order_status", "reservation", "general"):
+            s = "order_status" if not s else s
+            if s not in ("order_creation", "order_status", "reservation", "general"):
+                s = "order_status"
+        return s[:64]
 
 
 async def _resolve_order_for_status(
@@ -666,7 +795,7 @@ async def order_status_post(req: OrderStatusLookupRequest, db: AsyncSession = De
             select(Customer).where(Customer.phone == order.customer_phone)
         )).scalar_one_or_none()
         if _cust is not None and not (_cust.last_intent or "").strip():
-            _cust.last_intent = "order_status_check"
+            _cust.last_intent = "order_status"
     await db.commit()
     if order is None:
         hint = (

@@ -374,7 +374,13 @@ _STATUS_KW = ("order status", "status of my order", "status check",
 
 def _infer_call_purpose(c: Call) -> str:
     """Deterministic purpose for backfill (no LLM): tool type is ground
-    truth, then tool names, then linked orders, then transcript keywords."""
+    truth, then tool names, then transcript keywords.
+
+    NOTE: linked order_numbers alone are NOT creation evidence — an
+    order_status lookup touches an existing order (run 1678 looked up
+    PB-49/PB-48) and must stay order_status. Only a create_order tool
+    implies order_creation.
+    """
     typed = _TYPE_TO_PURPOSE.get((c.call_type or "").strip(), "")
     if typed:
         return typed
@@ -387,7 +393,7 @@ def _infer_call_purpose(c: Call) -> str:
                 return "order_status"
             if "order" in n or "create" in n:
                 return "order_creation"
-    if c.order_numbers:
+    if c.order_numbers and (c.call_type or "").strip() == "create_order":
         return "order_creation"
     blob = " ".join(
         str((t.get("content") or t.get("text") or "")) if isinstance(t, dict) else str(t or "")
@@ -412,6 +418,9 @@ async def backfill_purposes(db: AsyncSession = Depends(get_db)):
       echo) are realigned to the tool type, which is ground truth.
     Returns {scanned, updated}.
     """
+    _INTENT_NORM = {"order_status_check": "order_status",
+                    "order_placement": "order_creation",
+                    "status_check": "order_status"}
     calls = (await db.execute(select(Call))).scalars().all()
     updated = 0
     for c in calls:
@@ -426,5 +435,19 @@ async def backfill_purposes(db: AsyncSession = Depends(get_db)):
             if inferred and inferred != current:
                 c.call_purpose = inferred
                 updated += 1
+        # Keep customer_intent in the same vocab and realign mistags
+        # (run 1678: order_status call stored as order_creation).
+        norm = _INTENT_NORM.get((c.customer_intent or "").strip(), None)
+        if norm:
+            c.customer_intent = norm
+            updated += 1
+        elif (c.customer_intent or "").strip() in ("order_creation", "order_status", "reservation") \
+                and (c.call_purpose or "").strip() in ("order_creation", "order_status", "reservation") \
+                and {c.customer_intent.strip(), c.call_purpose.strip()} == {"order_creation", "order_status"}:
+            c.customer_intent = c.call_purpose.strip()
+            updated += 1
+        elif not (c.customer_intent or "").strip() and (c.call_purpose or "").strip():
+            c.customer_intent = c.call_purpose.strip()[:64]
+            updated += 1
     await db.commit()
     return {"scanned": len(calls), "updated": updated}
