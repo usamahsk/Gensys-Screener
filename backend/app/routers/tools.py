@@ -718,6 +718,9 @@ async def _resolve_order_for_status(
     """Return (order|None, effective_number, lookup_method).
 
     Methods: exact | via_call_id | via_call_log | via_phone | none.
+    Phone matching is country-code insensitive: callers speak 10 digits
+    ("9967835090") while rows may store "+919967835090" — digit suffixes
+    are compared instead of raw strings.
     """
     requested = (requested or "").strip()
     if requested:
@@ -759,20 +762,54 @@ async def _resolve_order_for_status(
                 ).scalar_one_or_none()
                 if o2:
                     return o2, o2.order_number, "via_call_log"
-    # Fallback 3: latest order for this phone.
-    if phone:
-        o3 = (
-            await db.execute(
+    # Fallback 3: latest order for this phone (country-code insensitive).
+    if phone and _digits(phone):
+        dd = _digits(phone)
+        cands: list[Order] = []
+        if len(dd) >= 7:
+            # DB prefilter on the trailing digits, then exact suffix match in
+            # Python (handles +91/+1 prefixes callers never speak).
+            tail = dd[-7:]
+            cands = (await db.execute(
+                select(Order)
+                .options(selectinload(Order.items), selectinload(Order.events))
+                .where(Order.customer_phone.ilike(f"%{tail}%"))
+                .order_by(Order.id.desc())
+                .limit(50)
+            )).scalars().all()
+        else:
+            cands = (await db.execute(
                 select(Order)
                 .options(selectinload(Order.items), selectinload(Order.events))
                 .where(Order.customer_phone == phone.strip())
                 .order_by(Order.id.desc())
                 .limit(1)
-            )
-        ).scalars().first()
-        if o3:
-            return o3, o3.order_number, "via_phone"
+            )).scalars().all()
+        for o3 in cands:
+            if _phones_match(o3.customer_phone, phone):
+                return o3, o3.order_number, "via_phone"
     return None, requested, "none"
+
+
+def _digits(s: object) -> str:
+    """Phone digits only: "+91 99678 35090" → "919967835090"."""
+    import re as _re
+    return _re.sub(r"\D", "", str(s or ""))
+
+
+def _phones_match(a: object, b: object) -> bool:
+    """Country-code-insensitive phone equality.
+
+    "9967835090" matches "+919967835090" (suffix), "+1..." US numbers match
+    their 10-digit spoken form. Short fragments (<7 digits) require exact
+    equality to avoid junk matches.
+    """
+    da, db = _digits(a), _digits(b)
+    if not da or not db:
+        return False
+    if len(da) < 7 or len(db) < 7:
+        return da == db
+    return da.endswith(db) or db.endswith(da)
 
 
 @router.post("/order-status", response_model=dict)
@@ -834,6 +871,7 @@ async def order_status_post(req: OrderStatusLookupRequest, db: AsyncSession = De
     data["requested_order_number"] = requested
     data["resolved_order_number"] = effective
     data["lookup_method"] = method
+    data["matched_phone"] = order.customer_phone if order else ""
     return data
 
 
@@ -880,9 +918,11 @@ async def order_status(
     return result
 
 
-@router.get("/order-status", response_model=OrderStatusResponse)
+@router.get("/order-status", response_model=dict)
 async def order_status_query(
-    order_number: str = Query(..., description="Order number, e.g. PB-A1B"),
+    order_number: Optional[str] = Query(default="", description="Order number, e.g. PB-1382"),
+    phone: Optional[str] = Query(default="", description="Customer phone digits (country code optional) — returns the latest order for it"),
+    customer_phone: Optional[str] = Query(default="", description="Alias of phone"),
     db: AsyncSession = Depends(get_db),
     call_id: Optional[str] = Query(default="", description="Call id, e.g. {{workflow_run_id}}"),
     first_name: Optional[str] = Query(default=""),
@@ -893,11 +933,20 @@ async def order_status_query(
     bot_recording_url: Optional[str] = Query(default=""),
     transcript_url: Optional[str] = Query(default=""),
 ):
-    """Query-param variant — friendlier for tool platforms without path params."""
-    result = await _lookup_order(order_number, db)
+    """Query-param variant — friendlier for tool platforms without path params.
+
+    URL structures:
+    - by number: /api/tools/order-status?order_number=PB-1382
+    - by phone (latest order, country code optional): /api/tools/order-status?phone=9967835090
+    - either + call logging: ...&call_id={{workflow_run_id}}
+    """
+    requested = clean_str(order_number)
+    ph = clean_str(customer_phone or phone)
+    order, effective, method = await _resolve_order_for_status(
+        db, requested, clean_str(call_id), ph)
     await _log_tool_call(
         db,
-        call_id=call_id or "",
+        call_id=clean_str(call_id),
         call_type="order_status",
         call_purpose="order_status",
         first_name=clean_str(first_name),
@@ -907,20 +956,35 @@ async def order_status_query(
         user_recording_url=clean_str(user_recording_url),
         bot_recording_url=clean_str(bot_recording_url),
         transcript_url=clean_str(transcript_url),
-        order_number=order_number,
+        order_number=effective,
         tool_name="order_status",
-        tool_summary=order_number,
-        customer_name=result.order.customer_name if result.found and result.order else "",
-        customer_phone=result.order.customer_phone if result.found and result.order else "",
+        tool_summary=effective or requested or ph or "(no order number)",
+        customer_name=order.customer_name if order else "",
+        customer_phone=order.customer_phone if order else ph,
     )
-    if result.found and result.order and result.order.customer_phone:
+    if order is not None and order.customer_phone:
         _cust = (await db.execute(
-            select(Customer).where(Customer.phone == result.order.customer_phone)
+            select(Customer).where(Customer.phone == order.customer_phone)
         )).scalar_one_or_none()
         if _cust is not None and not (_cust.last_intent or "").strip():
-            _cust.last_intent = "order_status_check"
+            _cust.last_intent = "order_status"
     await db.commit()
-    return result
+    if order is None:
+        hint = (
+            "No order number was provided and none could be resolved from call_id/phone. "
+            "Ask the customer for their order number (e.g. PB-1382) or phone number."
+            if not requested else f"No order found for {requested}"
+        )
+        return {"found": False, "message": hint,
+                "requested_order_number": requested, "resolved_order_number": "",
+                "lookup_method": method, "matched_phone": ""}
+    payload = OrderStatusResponse(found=True, order=order)  # type: ignore[arg-type]
+    data = payload.model_dump()
+    data["requested_order_number"] = requested
+    data["resolved_order_number"] = effective
+    data["lookup_method"] = method
+    data["matched_phone"] = order.customer_phone
+    return data
 
 
 # --------------------------------------------------------------- reservation

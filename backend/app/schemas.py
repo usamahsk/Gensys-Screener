@@ -585,9 +585,13 @@ class CallEndedWebhook(BaseModel):
     reservation_date: str = ""
     reservation_time: str = ""
 
-    # escalation
+    # escalation (transfer-bifurcation prompt output — a staff-assistance
+    # request handled after the call, NOT necessarily a live transfer)
     transfer_requested: bool = False
     transfer_reason: str = ""
+    requested_person: str = ""
+    callback_phone: str = ""
+    evidence: Any = None
     genesys_conversation_id: str = ""
 
     @model_validator(mode="before")
@@ -642,6 +646,17 @@ class CallEndedWebhook(BaseModel):
             "transcript url": "transcript_url",
             "duration_seconds": "duration",
             "call_duration_seconds": "duration",
+            "transfer requested": "transfer_requested",
+            "transfer_requested": "transfer_requested",
+            "staff request": "transfer_requested",
+            "staff_request": "transfer_requested",
+            "transfer reason": "transfer_reason",
+            "transfer_requested_reason": "transfer_reason",
+            "reason_for_transfer": "transfer_reason",
+            "requested person": "requested_person",
+            "requested_person": "requested_person",
+            "callback phone": "callback_phone",
+            "callback_phone": "callback_phone",
         }
         normalized = {str(k).strip().lower().replace("-", " "): v for k, v in data.items()}
         for alias, canonical in aliases.items():
@@ -700,7 +715,8 @@ class CallEndedWebhook(BaseModel):
                      "recording_url", "user_recording_url", "bot_recording_url",
                      "transcript_url", "call_outcome", "sentiment", "disposition",
                      "order_number", "fulfillment_type", "delivery_address",
-                     "payment_method", "transfer_reason", "genesys_conversation_id",
+                     "payment_method", "transfer_reason", "requested_person",
+                     "callback_phone", "genesys_conversation_id",
                      "provider", "provider_call_id", "telephony_id",
                      "telephony_call_id", "call_sid",
                      "reservation_date", "reservation_time", mode="before")
@@ -828,11 +844,25 @@ class CallEndedWebhook(BaseModel):
         return (
             clean_str(self.customer_phone)
             or clean_str(self.phone)
+            or clean_str(self.callback_phone)
             or self._nested_customer(
                 "customer_phone", "phone", "phone_number", "phoneNumber",
                 "caller_number", "callerNumber", "from_number", "from",
-                "msisdn", "ani", "caller_id", "callerId")
+                "msisdn", "ani", "caller_id", "callerId",
+                "callback_phone", "callbackPhone")
         )
+
+    def resolved_transfer_reason(self) -> str:
+        """Bifurcation reason with the requested person folded in.
+
+        "asked for manager (requested: shift manager)" — Agent View shows
+        one line with both halves of the transfer prompt's output.
+        """
+        reason = clean_str(self.transfer_reason)
+        person = clean_str(self.requested_person)
+        if reason and person:
+            return f"{reason} (requested: {person})"[:512]
+        return (reason or person)[:512]
 
     def resolved_first_name(self) -> str:
         return (

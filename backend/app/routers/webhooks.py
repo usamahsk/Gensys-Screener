@@ -56,7 +56,7 @@ async def call_ended(
         if incoming_disposition == "transferred" and existing.disposition != "transferred":
             existing.disposition = "transferred"
             updated_fields.append("disposition")
-        incoming_reason = (payload.transfer_reason or "").strip()
+        incoming_reason = payload.resolved_transfer_reason()
         if not (existing.escalation_reason or "").strip():
             reason_fill = incoming_reason or (
                 _infer_transfer_reason(payload.transcript or existing.transcript,
@@ -248,7 +248,7 @@ async def call_ended(
         tool_calls=payload.tool_calls,
         order_numbers=order_numbers,
         summary=summary,
-        escalation_reason=payload.transfer_reason
+        escalation_reason=payload.resolved_transfer_reason()
         or _infer_transfer_reason(payload.transcript, payload.tool_calls,
                                   payload.gathered_context, payload.initial_context),
         sentiment=payload.sentiment or "",
@@ -494,6 +494,7 @@ async def _run_transcript_extraction(
         _apply_extraction,
         _download_text,
         analyze_transcript,
+        apply_transfer,
         build_order_from_req,
         get_google_key,
     )
@@ -520,6 +521,10 @@ async def _run_transcript_extraction(
         return None
     if (call.call_purpose or "").strip() in ("", "general") and result["purpose"]:
         call.call_purpose = result["purpose"]
+    # Staff request in the transcript routes the call to Agent View even
+    # when the webhook carried no transfer fields (order creation, if any,
+    # still proceeds below — the two artifacts coexist).
+    apply_transfer(call, result)
     req = result["req"]
     if req is None:
         return None

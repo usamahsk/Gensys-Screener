@@ -371,6 +371,8 @@ Return {"no_order": true, "call_purpose": "<one of the four>", "reason": "<short
 - order_status / reservation / general calls place nothing new.
 - The agent only SUGGESTED items but the customer never engaged with ordering.
 
+Staff-assistance requests (transfer bifurcation — applies to EVERY purpose, including order_creation): return "transfer_requested": true when the caller explicitly asks to speak with a manager/staff/human, asks to be transferred/connected/put through, asks for a staff callback, or clearly accepts an offer of staff help — even mid-order. NOT a request: order/status/reservation handling alone, complaints/refunds/allergy mentions without asking for a person, asking IF transfers are possible, money transfers, agent-only follow-up mentions, withdrawn requests. With true, add "transfer_reason": "<brief factual why>" (empty string when unstated). Otherwise "transfer_requested": false, "transfer_reason": "".
+
 When the customer attempted to order (order_creation) ALWAYS return the order JSON below — even when details are missing or it was never confirmed (hangup, transfer, missing name/phone/items). Never use no_order for an order attempt. Put what you heard, empty strings for what you did not, and list the gaps in "missing_fields". Set "order_confirmed": true ONLY when the customer explicitly confirmed it (words like "yes, place it", "confirm", "that's all, go ahead") AND the agent acknowledged it (read back items / total / order number, or said it is confirmed); else false.
 
 Order JSON (ONLY valid JSON, no markdown, no explanation) with exactly these keys:
@@ -386,7 +388,9 @@ Order JSON (ONLY valid JSON, no markdown, no explanation) with exactly these key
   "delivery_address": "if mentioned else empty string",
   "payment_method": "cash/UPI/card if mentioned else empty string",
   "email": "if mentioned else empty string (optional — never block an order on it)",
-  "missing_fields": ["subset of: customer_name, customer_phone, items, order_number, confirmation, payment_method, delivery_address, order_type"]
+  "missing_fields": ["subset of: customer_name, customer_phone, items, order_number, confirmation, payment_method, delivery_address, order_type"],
+  "transfer_requested": false,
+  "transfer_reason": ""
 }
 Prices (all in dollars): if the call quotes a price, use it. If the price is missing, look it up in the MENU below and fill it in — a missing price must never block the order. Pizzas with no size heard default to Medium. "Thin"/"Regular" alone mean crust (free) — put crust in notes, never in size, and price by Small/Medium/Large (Medium when unheard). Only items with no menu match stay 0. "total" must equal the sum of quantity × unit_price.
 MENU:
@@ -622,27 +626,33 @@ async def analyze_transcript(text: str, api_key: str, model: str) -> dict:
       saves it with status `incomplete` when fields are missing.
     - order_status / reservation / general yield req=None (no order row).
     """
-    from app.schemas import OrderCreateRequest as _OCR
+    from app.schemas import OrderCreateRequest as _OCR, coerce_bool, clean_str as _cs
     data = await _ask_gemini(text, api_key, model or "gemini-3.5-flash")
     if not data:
         # LLM call failed (quota/5xx/invalid JSON) — unknown stays unknown:
         # callers must NOT tag the call "general" off a failed lookup.
         return {"req": None, "purpose": "", "missing": [],
-                "no_order": True, "reason": "llm_error"}
+                "no_order": True, "reason": "llm_error",
+                "transfer_requested": False, "transfer_reason": ""}
     purpose = _normalize_purpose(data.get("call_purpose"), data, text)
+    transfer_requested = coerce_bool(data.get("transfer_requested")) \
+        if not isinstance(data.get("transfer_requested"), bool) else bool(data.get("transfer_requested"))
+    transfer_reason = _cs(data.get("transfer_reason"))[:512]
     if data.get("no_order"):
         if data.get("reason"):
             logger.info(f"order_recovery: no order ({data.get('reason')}) purpose={purpose}")
         if purpose not in CALL_PURPOSES:
             purpose = "general"
         return {"req": None, "purpose": purpose, "missing": [],
-                "no_order": True, "reason": str(data.get("reason") or "")}
+                "no_order": True, "reason": str(data.get("reason") or ""),
+                "transfer_requested": transfer_requested, "transfer_reason": transfer_reason}
     try:
         req = _OCR.model_validate(data)
     except Exception as e:
         logger.warning(f"order_recovery: Gemini JSON failed validation: {e}")
         return {"req": None, "purpose": purpose, "missing": [],
-                "no_order": True, "reason": "validation"}
+                "no_order": True, "reason": "validation",
+                "transfer_requested": transfer_requested, "transfer_reason": transfer_reason}
     # Order JSON without an explicit purpose is an order_creation attempt.
     purpose = _normalize_purpose(req.call_purpose or data.get("call_purpose"),
                                  data, text, order_json=True)
@@ -650,11 +660,33 @@ async def analyze_transcript(text: str, api_key: str, model: str) -> dict:
     if purpose in _NON_ORDER_PURPOSES:
         logger.info(f"order_recovery: {purpose} call — tagging only, no order row")
         return {"req": None, "purpose": purpose, "missing": [],
-                "no_order": True, "reason": purpose}
+                "no_order": True, "reason": purpose,
+                "transfer_requested": transfer_requested, "transfer_reason": transfer_reason}
     missing = _compute_missing(req, text)
     req.missing_fields = missing
     return {"req": req, "purpose": "order_creation", "missing": missing,
-            "no_order": False, "reason": ""}
+            "no_order": False, "reason": "",
+            "transfer_requested": transfer_requested, "transfer_reason": transfer_reason}
+
+
+def apply_transfer(call, result) -> bool:
+    """Route staff-request calls to Agent View. Returns True when applied.
+
+    A Gemini-detected staff request upgrades a completed call to
+    transferred and fills the reason — so transfer conversations reach
+    Agent View even when the webhook carried no transfer fields. Technical
+    failed/abandoned dispositions are left alone; order creation (when the
+    transcript also holds an order attempt) still proceeds separately.
+    """
+    if not (result or {}).get("transfer_requested"):
+        return False
+    if (call.disposition or "").strip() not in ("", "completed"):
+        return False
+    call.disposition = "transferred"
+    reason = str((result or {}).get("transfer_reason") or "").strip()[:512]
+    if reason and not (call.escalation_reason or "").strip():
+        call.escalation_reason = reason
+    return True
 
 
 async def extract_request_from_text(text: str, api_key: str, model: str):
@@ -830,6 +862,7 @@ async def create_order_from_transcript(
             call.call_purpose = purpose
     except Exception:
         pass
+    apply_transfer(call, result)
     req = result["req"]
     if req is None:
         return None
@@ -943,12 +976,14 @@ async def recover_order_from_call(call_id: str, order_number: str | None = None)
         purpose = result["purpose"]
         if (call.call_purpose or "").strip() in ("", "general") and purpose:
             call.call_purpose = purpose
+        apply_transfer(call, result)
         req = result["req"]
         if req is None:
-            await db.commit()  # persist the purpose tag even with no order
+            await db.commit()  # persist purpose + transfer tags even with no order
             reason = result.get("reason") or "no order in transcript"
             return {"status": "skipped", "reason": reason,
-                    "call_purpose": purpose, "call_id": call_id}
+                    "call_purpose": purpose, "call_id": call_id,
+                    "transfer_requested": bool(result.get("transfer_requested"))}
 
         if order:
             _apply_extraction(order, req, call, shell_empty)

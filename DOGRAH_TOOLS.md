@@ -175,8 +175,14 @@ Sample response (resolved via call):
 
 ## Tool 2 (legacy GET variants — still supported)
 
-**GET:** `<BASE>/api/tools/order-status?order_number={{order_number}}&call_id={{workflow_run_id}}`
-or `<BASE>/api/tools/orders/{{order_number}}?call_id={{workflow_run_id}}`
+**GET by order number:** `<BASE>/api/tools/order-status?order_number=PB-1382`
+**GET by phone (latest order, country code optional):** `<BASE>/api/tools/order-status?phone=9967835090`
+**Either + call logging:** append `&call_id={{workflow_run_id}}`
+
+Phone matching ignores country codes — `9967835090` finds `+919967835090`
+(and `5551234567` finds `+15551234567`). Response adds `lookup_method`
+(`exact` | `via_call_id` | `via_call_log` | `via_phone`) and
+`matched_phone`.
 
 Parameters (query):
 
@@ -328,10 +334,22 @@ To make the spoken number and the stored order identical:
   "customer_phone": "+919812345670",
   "transcript": [ { "role": "customer", "content": "..." }, { "role": "assistant", "content": "..." } ],
   "tool_calls": [ { "name": "create_order", "args_summary": "Pepperoni Large x1" } ],
-  "order_numbers": ["PB-A1B"]
+  "order_numbers": ["PB-1382"]
 }
 ```
 `disposition`: completed | transferred | failed | abandoned.
+
+**Transfer bifurcation** — if your workflow classifies staff-assistance
+requests (manager/human/callback/transfer), map its output straight onto the
+same webhook: `transfer_requested` (true/false, aliases `staff_request`),
+`transfer_reason`, `requested_person` (folded into the reason as
+"<reason> (requested: <person>)"), `callback_phone` (used as the customer
+phone when no other number is present), plus the existing `order_number`
+when the request relates to one. Any of these marks the call `transferred`
+so it appears in Agent View with the reason. No transfer fields? The
+transcript is still scanned for staff requests during extraction, and a real
+order attempt in the same call still creates its order row — the two
+artifacts coexist.
 
 > **Empty customer on transactions?** The app reads `customer_name` /
 > `customer_phone` (or `phone`) top-level first, then falls back to nested
