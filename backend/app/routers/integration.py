@@ -971,9 +971,18 @@ async def upload_kb_document(
     Flow: presigned URL → PUT bytes → process-document (chunking+embedding).
     Returns the Dograh document record (processing continues in background).
     """
+    from loguru import logger as _logger
+
     s = await _get_setting(db)
-    if not s.api_key:
-        raise HTTPException(400, "No voice platform API key configured")
+    if not (s.api_key or "").strip():
+        _logger.warning(
+            f"KB upload without API key | base_url={s.base_url or ''} "
+            "— if runs work elsewhere, this request hit a different "
+            "backend/DB (stale container?) — save the key in Settings on THIS server")
+        raise HTTPException(
+            400,
+            f"No voice platform API key on this server (base_url={s.base_url or 'unset'}). "
+            "Save it in Settings → Voice platform on this same host, then retry.")
     import os as _os
     filename = (file.filename or "document").strip() or "document"
     ext = _os.path.splitext(filename)[1].lower()
