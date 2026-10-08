@@ -1183,6 +1183,16 @@ class LogCallRequest(BaseModel):
     gathered_context: Optional[Any] = None
     customer_intent: Optional[Any] = ""
     call_purpose: Optional[Any] = ""
+    # Same order-context fields create_order accepts, so log-call captures
+    # the identical context without creating an order row. Values merge into
+    # gathered_context; order_number also links onto the call's order list.
+    email: Optional[Any] = ""
+    order_number: Optional[Any] = ""
+    order_type: Optional[Any] = ""
+    table_number: Optional[Any] = ""
+    pickup_time: Optional[Any] = ""
+    delivery_address: Optional[Any] = ""
+    payment_method: Optional[Any] = ""
 
     @model_validator(mode="before")  # type: ignore[misc]
     @classmethod
@@ -1197,6 +1207,16 @@ class LogCallRequest(BaseModel):
         aliases = {
             "workflow run id": "call_id",
             "workflow_run_id": "call_id",
+            "order number": "order_number",
+            "order id": "order_number",
+            "ordernumber": "order_number",
+            "fulfillment type": "order_type",
+            "fulfillment_type": "order_type",
+            "order type": "order_type",
+            "table": "table_number",
+            "pickup time": "pickup_time",
+            "delivery address": "delivery_address",
+            "payment method": "payment_method",
             "tool name": "tool_name",
             "toolname": "tool_name",
             "input": "inputs",
@@ -1284,13 +1304,28 @@ async def log_tool_call(req: LogCallRequest, request: Request, db: AsyncSession 
                            "Add call_id as a preset parameter with value {{workflow_run_id}}."}
     tool_name = req.resolved_tool_name()
     summary = req.resolved_inputs_summary() or "(no inputs)"
+    # create_order parity: fold the order-context fields into gathered_context
+    # so log-call captures the identical context (email, fulfillment, table,
+    # pickup, address, payment) without creating an order row.
+    _gctx = req._ctx(req.gathered_context)
+    for _k, _v in (
+        ("email", req._s(req.email)),
+        ("order_number", req._s(req.order_number)),
+        ("order_type", req._s(req.order_type)),
+        ("table_number", req._s(req.table_number)),
+        ("pickup_time", req._s(req.pickup_time)),
+        ("delivery_address", req._s(req.delivery_address)),
+        ("payment_method", req._s(req.payment_method)),
+    ):
+        if _v and _k not in _gctx:
+            _gctx[_k] = _v
     logger.info(
         f"POST /api/tools/log-call from {request.client.host if request.client else '?'} "
         f"| call_id={call_id!r} tool={tool_name!r} inputs={summary[:200]!r} "
         f"prov={req._s(req.provider)!r} pcall={clean_str(req.provider_call_id or req.telephony_id)!r} "
         f"gen={req._s(req.genesys_conversation_id)!r} "
         f"ictx={ctx_key_summary(req._ctx(req.initial_context))} "
-        f"gctx={ctx_key_summary(req._ctx(req.gathered_context))}"
+        f"gctx={ctx_key_summary(_gctx)}"
     )
     call = await _log_tool_call(
         db,
@@ -1306,12 +1341,13 @@ async def log_tool_call(req: LogCallRequest, request: Request, db: AsyncSession 
         user_recording_url=clean_str(req.user_recording_url),
         bot_recording_url=clean_str(req.bot_recording_url),
         transcript_url=clean_str(req.transcript_url),
+        order_number=req._s(req.order_number),
         tool_name=tool_name,
         tool_summary=summary,
         provider=req._s(req.provider),
         provider_call_id=clean_str(req.provider_call_id or req.telephony_id),
         initial_context=req._ctx(req.initial_context),
-        gathered_context=req._ctx(req.gathered_context),
+        gathered_context=_gctx,
         customer_intent=req._s(req.customer_intent),
         genesys_conversation_id=req._s(req.genesys_conversation_id),
     )
