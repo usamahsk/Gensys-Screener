@@ -282,7 +282,15 @@ async def _log_tool_call(
         provider, provider_call_id, initial_context, gathered_context)
     # Explicit top-level Genesys id (Dograh preset mapped straight from the
     # session-created conversation id) beats anything inferred from contexts.
+    # Warn when it contradicts the contexts' conversation id — that means the
+    # Dograh preset is wired to the session/correlation variable instead of
+    # {{initial_context.genesys_conversation_id}}.
     _explicit_gen = (genesys_conversation_id or "").strip()
+    if _explicit_gen and _genesys and _explicit_gen != _genesys:
+        logger.warning(
+            f"call {call_id!r}: explicit genesys_conversation_id={_explicit_gen[:36]!r} "
+            f"contradicts context conversation={_genesys[:36]!r} — keeping explicit; "
+            "check the Dograh preset mapping (want genesys_conversation_id, not session)")
     if _explicit_gen:
         _genesys = _explicit_gen[:64]
         if provider == "dograh":

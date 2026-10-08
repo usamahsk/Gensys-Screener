@@ -262,9 +262,23 @@ async def backfill_provider_ids(db: AsyncSession = Depends(get_db)):
     runs_scanned = 0
     for c in all_calls:
         need_customer = not (c.customer_phone or "").strip() or not (c.customer_name or "").strip()
+        # Free fix first (no API call): the row's OWN stored contexts may
+        # already carry the conversation id while the columns hold the
+        # session id (miswired Dograh preset / pre-fix row). Realign now.
+        _stored_conv = _conv_from_scopes(
+            [c.initial_context or {}, c.gathered_context or {}])
+        if _stored_conv and (c.provider or "") == "genesys":
+            if (c.provider_call_id or "").strip() != _stored_conv:
+                c.provider_call_id = _stored_conv[:128]
+                updated_calls += 1
+            if (c.genesys_conversation_id or "").strip() != _stored_conv:
+                c.genesys_conversation_id = _stored_conv[:64]
+                updated_calls += 1
         # A Genesys row whose Provider ID is the session id (not the
         # conversation id) still needs one run-detail pass to realign it.
-        need_realign = (c.provider or "") == "genesys" and not (c.genesys_conversation_id or "").strip()
+        need_realign = (c.provider or "") == "genesys" and (
+            not (c.genesys_conversation_id or "").strip()
+            or (c.provider_call_id or "").strip() != (c.genesys_conversation_id or "").strip())
         if c.provider_call_id and not need_customer and not need_realign:
             continue
         pid, prov = "", ""
@@ -389,6 +403,22 @@ async def backfill_provider_ids(db: AsyncSession = Depends(get_db)):
     await db.commit()
     return {"updated_calls": updated_calls, "updated_orders": updated_orders,
             "updated_customers": updated_customers, "runs_scanned": runs_scanned}
+
+
+def _conv_from_scopes(scopes: list[dict]) -> str:
+    """Conversation id out of stored run contexts (nested dicts included)."""
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        nested: list[dict] = [scope] + [
+            v for v in scope.values() if isinstance(v, dict)]
+        for s in nested:
+            for k in ("genesys_conversation_id", "conversation_id",
+                      "genesysConversationId", "conversationId"):
+                v = s.get(k)
+                if isinstance(v, str) and v.strip() and "{{" not in v:
+                    return v.strip()[:64]
+    return ""
 
 
 _TYPE_TO_PURPOSE = {"create_order": "order_creation",
