@@ -44,7 +44,7 @@ export default function RegisterPage() {
             <UserPlus className="h-4 w-4 text-[#0068FF]" /> Register
           </CardTitle>
           <CardDescription>
-            Mock registration stored in the app database. No email verification, no API keys.
+            Create an account to access the dashboard.
           </CardDescription>
         </CardHeader>
         <CardContent>

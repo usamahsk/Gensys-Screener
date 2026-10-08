@@ -43,7 +43,7 @@ export default function LoginPage() {
             <LogIn className="h-4 w-4 text-[#0068FF]" /> Sign in
           </CardTitle>
           <CardDescription>
-            Mock sign-in for the dashboard. Tool & webhook APIs stay open — no key needed there.
+            Sign in to access the dashboard.
           </CardDescription>
         </CardHeader>
         <CardContent>
