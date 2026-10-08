@@ -996,6 +996,27 @@ async def upload_kb_document(
         raise
     except Exception as e:
         raise HTTPException(502, f"Voice platform request failed: {e}")
+    # Keep a local copy: Dograh serves no file bytes for KB documents, so
+    # dashboard downloads are served from here. Best-effort — never fails
+    # the upload.
+    try:
+        from app.models import KbFile as _KbFile
+        duuid = str(up.get("document_uuid") or "")
+        if duuid:
+            old = (await db.execute(
+                select(_KbFile).where(_KbFile.document_uuid == duuid)
+            )).scalar_one_or_none()
+            if old:
+                old.filename, old.mime_type, old.data = filename[:256], mime, data
+            else:
+                db.add(_KbFile(document_uuid=duuid, filename=filename[:256],
+                              mime_type=mime, data=data))
+            await db.commit()
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
     return {"status": "uploaded", "retrieval_mode": mode, "document": doc}
 
 
@@ -1008,6 +1029,19 @@ async def delete_kb_document(document_uuid: str, db: AsyncSession = Depends(get_
         await dograh_client.delete_kb_document(s.api_key, s.base_url, document_uuid)
     except Exception as e:
         raise HTTPException(502, f"Voice platform request failed: {e}")
+    try:
+        from app.models import KbFile as _KbFile
+        old = (await db.execute(
+            select(_KbFile).where(_KbFile.document_uuid == (document_uuid or "").strip())
+        )).scalar_one_or_none()
+        if old:
+            await db.delete(old)
+            await db.commit()
+    except Exception:
+        try:
+            await db.rollback()
+        except Exception:
+            pass
     return {"status": "deleted", "document_uuid": document_uuid}
 
 
@@ -1015,20 +1049,39 @@ async def delete_kb_document(document_uuid: str, db: AsyncSession = Depends(get_
 async def download_kb_document(document_uuid: str, db: AsyncSession = Depends(get_db)):
     """Download a KB document's original file through our backend.
 
-    The browser hits this URL directly (anchor with `download`), so the file
-    lands on whatever PC/machine the browser runs on. Resolution order:
-    minted download-url → metadata file/download URL fields → 502 with a
-    clear reason when the voice platform exposes no file bytes.
+    Resolution order: local copy kept at upload time → minted Dograh
+    download-url → metadata file/download URL fields → 502 with a clear
+    reason. Dograh exposes no file bytes for KB documents, so only files
+    uploaded through this dashboard (which keeps a copy) are guaranteed
+    downloadable.
     """
     from fastapi.responses import StreamingResponse
     from urllib.parse import quote
 
-    s = await _get_setting(db)
-    if not s.api_key:
-        raise HTTPException(400, "No voice platform API key configured")
     uuid = (document_uuid or "").strip()
     if not uuid:
         raise HTTPException(400, "Missing document id")
+    try:
+        from app.models import KbFile as _KbFile
+        local = (await db.execute(
+            select(_KbFile).where(_KbFile.document_uuid == uuid)
+        )).scalar_one_or_none()
+        if local and local.data:
+            fname = local.filename or f"{uuid}.bin"
+            disp = (f"attachment; filename=\"{fname.replace(chr(34), '')}\"; "
+                    f"filename*=UTF-8''{quote(fname)}")
+            return StreamingResponse(
+                iter([bytes(local.data)]),
+                media_type=local.mime_type or "application/octet-stream",
+                headers={"Content-Disposition": disp})
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    s = await _get_setting(db)
+    if not s.api_key:
+        raise HTTPException(400, "No voice platform API key configured")
 
     meta: dict = {}
     try:
@@ -1074,6 +1127,5 @@ async def download_kb_document(document_uuid: str, db: AsyncSession = Depends(ge
                                      headers={"Content-Disposition": disp})
     raise HTTPException(
         502,
-        "No downloadable file URL for this document on the voice platform "
-        "(tried download-url endpoints + metadata file fields). The file may "
-        "be chunked/embedded-only — re-upload the original to keep a copy.")
+        "No copy of this file on the voice platform or this server. "
+        "Re-upload it here (a local copy is kept for future downloads).")

@@ -10,6 +10,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -271,4 +272,23 @@ class AppUser(Base):
     email: Mapped[str] = mapped_column(String(256), unique=True, index=True)
     name: Mapped[str] = mapped_column(String(128), default="")
     password_hash: Mapped[str] = mapped_column(String(256), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class KbFile(Base):
+    """Local copy of an uploaded knowledge-base file (≤5 MB each).
+
+    Dograh exposes no file bytes/download URL for KB documents (only an
+    internal s3_key), so the dashboard keeps the original bytes uploaded
+    through it — downloads are served from here first, Dograh second.
+    Files uploaded outside this dashboard have no local copy.
+    """
+
+    __tablename__ = "kb_files"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    document_uuid: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    filename: Mapped[str] = mapped_column(String(256), default="")
+    mime_type: Mapped[str] = mapped_column(String(128), default="application/octet-stream")
+    data: Mapped[bytes] = mapped_column(LargeBinary)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
