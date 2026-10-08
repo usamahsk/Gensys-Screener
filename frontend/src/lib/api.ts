@@ -407,6 +407,40 @@ export const apiClient = {
     ),
   knowledgeDocDownloadUrl: (uuid: string) =>
     `${API_URL}/api/integration/dograh/knowledge-base/${encodeURIComponent(uuid)}/download`,
+  downloadKnowledgeDoc: async (uuid: string, filename: string) => {
+    // Fetch-as-blob (not a plain anchor): a plain navigation to the absolute
+    // API host shows a dead "site can't be reached" page on any host mismatch
+    // and hides the backend's real error. Here failures surface as toasts
+    // with the backend reason (e.g. no file URL, expired link, no API key).
+    const res = await fetch(
+      `${API_URL}/api/integration/dograh/knowledge-base/${encodeURIComponent(uuid)}/download`,
+      { cache: "no-store" }
+    );
+    if (!res.ok) {
+      let msg = `${res.status} ${res.statusText}`;
+      try {
+        const j = await res.json();
+        if (typeof j?.detail === "string" && j.detail.trim()) msg = j.detail;
+      } catch {
+        try {
+          const t = await res.text();
+          if (t.trim()) msg = t.slice(0, 300);
+        } catch {
+          /* keep status text */
+        }
+      }
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const objUrl = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = objUrl;
+    a.download = filename || "document";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(objUrl), 5000);
+  },
   uploadKnowledgeDoc: async (file: File, retrievalMode = "chunked") => {
     const form = new FormData();
     form.append("file", file);

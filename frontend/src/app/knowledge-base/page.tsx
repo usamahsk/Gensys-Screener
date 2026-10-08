@@ -5,7 +5,6 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/components/page-header";
 import { apiClient, type KnowledgeDocument } from "@/lib/api";
@@ -78,6 +77,18 @@ export default function KnowledgeBasePage() {
       load();
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Delete failed");
+    }
+  };
+
+  const [downloading, setDownloading] = useState<string | null>(null);
+  const download = async (uuid: string, name: string) => {
+    setDownloading(uuid);
+    try {
+      await apiClient.downloadKnowledgeDoc(uuid, name);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Download failed");
+    } finally {
+      setDownloading(null);
     }
   };
 
@@ -154,69 +165,61 @@ export default function KnowledgeBasePage() {
             Documents ({total || docs.length})
           </CardTitle>
         </CardHeader>
-        <CardContent className="p-0">
-          <div className="overflow-x-auto">
-            <Table className="min-w-[640px]">
-              <TableHeader>
-                <TableRow>
-                  <TableHead>File</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Mode</TableHead>
-                  <TableHead className="text-right">Chunks</TableHead>
-                  <TableHead>Updated</TableHead>
-                  <TableHead className="w-28"></TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {docs.map((d) => (
-                  <TableRow key={d.document_uuid}>
-                    <TableCell>
-                      <div className="text-sm font-medium">{d.filename}</div>
-                      <div className="text-xs text-muted-foreground">
+        <CardContent>
+          {docs.length === 0 ? (
+            <div className="py-8 text-center text-sm text-muted-foreground">
+              {loading ? "Loading documents…" : "No documents yet — upload your menu or FAQ above."}
+            </div>
+          ) : (
+            <ul className="min-w-0 space-y-2">
+              {docs.map((d) => (
+                <li
+                  key={d.document_uuid}
+                  className="min-w-0 rounded-xl border border-[#E2E8F4] bg-[#F7F9FE] p-3"
+                >
+                  <div className="flex min-w-0 items-start gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="break-words text-sm font-medium">{d.filename}</div>
+                      <div className="mt-0.5 text-xs text-muted-foreground">
                         {(d.file_size_bytes / 1024).toFixed(0)} KB · {d.mime_type}
                       </div>
-                      {d.processing_error ? (
-                        <div className="text-xs text-red-600">{d.processing_error}</div>
-                      ) : null}
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant="secondary" className={statusClass(d.processing_status)}>
-                        {d.processing_status}
-                      </Badge>
-                    </TableCell>
-                    <TableCell className="text-sm">{d.retrieval_mode?.replace("_", " ")}</TableCell>
-                    <TableCell className="text-right text-sm">{d.total_chunks}</TableCell>
-                    <TableCell className="text-xs text-muted-foreground">
+                    </div>
+                    <Badge variant="secondary" className={`${statusClass(d.processing_status)} shrink-0`}>
+                      {d.processing_status}
+                    </Badge>
+                  </div>
+                  {d.processing_error ? (
+                    <div className="mt-1 break-words text-xs text-red-600">{d.processing_error}</div>
+                  ) : null}
+                  <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                    <span className="capitalize">{d.retrieval_mode?.replace("_", " ")}</span>
+                    <span>{d.total_chunks} chunks</span>
+                    <span>
                       {new Date(d.updated_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center justify-end gap-1">
-                        <a
-                          href={apiClient.knowledgeDocDownloadUrl(d.document_uuid)}
-                          download={d.filename}
-                          title={`Download ${d.filename} to this machine`}
-                        >
-                          <Button size="sm" variant="ghost" title="Download">
-                            <Download className="h-4 w-4 text-[#0068FF]" />
-                          </Button>
-                        </a>
-                        <Button size="sm" variant="ghost" title="Delete" onClick={() => remove(d.document_uuid, d.filename)}>
-                          <Trash2 className="h-4 w-4 text-red-600" />
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                ))}
-                {docs.length === 0 && (
-                  <TableRow>
-                    <TableCell colSpan={6} className="py-8 text-center text-sm text-muted-foreground">
-                      {loading ? "Loading documents…" : "No documents yet — upload your menu or FAQ above."}
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-          </div>
+                    </span>
+                    <span className="ml-auto flex items-center gap-1">
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        title={`Download ${d.filename} to this machine`}
+                        disabled={downloading === d.document_uuid}
+                        onClick={() => download(d.document_uuid, d.filename)}
+                      >
+                        {downloading === d.document_uuid ? (
+                          <Loader2 className="h-4 w-4 animate-spin text-[#0068FF]" />
+                        ) : (
+                          <Download className="h-4 w-4 text-[#0068FF]" />
+                        )}
+                      </Button>
+                      <Button size="sm" variant="ghost" title="Delete" onClick={() => remove(d.document_uuid, d.filename)}>
+                        <Trash2 className="h-4 w-4 text-red-600" />
+                      </Button>
+                    </span>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
         </CardContent>
       </Card>
     </div>
