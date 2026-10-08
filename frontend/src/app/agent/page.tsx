@@ -152,8 +152,10 @@ export default function AgentViewPage() {
 
       {error && <div className="rounded-md border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</div>}
 
-      <div className="grid gap-4 lg:grid-cols-[320px_1fr]">
-        <div className="space-y-2">
+      <div className="grid items-start gap-4 lg:grid-cols-[320px_1fr]">
+        {/* Escalated-call list: capped to the viewport with its own scroll,
+            so picking a call below never pushes the details out of view. */}
+        <div className="space-y-2 lg:sticky lg:top-0 lg:max-h-[calc(100vh-13rem)] lg:overflow-y-auto lg:pb-1 lg:pr-1">
           {transferred.map((c) => (
             <button
               key={c.call_id}
@@ -180,7 +182,7 @@ export default function AgentViewPage() {
         </div>
 
         {selected && (
-          <div className="space-y-4">
+          <div className="min-w-0 space-y-4 lg:max-h-[calc(100vh-13rem)] lg:overflow-y-auto lg:pb-1 lg:pr-1">
             <Card className="card-clean">
               <CardHeader className="pb-2">
                 <CardTitle className="flex items-center gap-2 text-sm text-[#000E49]">
