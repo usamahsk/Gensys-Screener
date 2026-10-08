@@ -22,7 +22,7 @@ from sqlalchemy.orm import selectinload
 
 from app.db import get_db
 from app.models import Call, Customer, Memory, Order, OrderEvent, OrderItem
-from app.schemas import CallEndedWebhook, TransferContextResponse, TransferWebhook
+from app.schemas import CallEndedWebhook, TransferContextResponse, TransferWebhook, ctx_key_summary
 from app.services.embeddings import embed_one
 from app.services.summarizer import summarize
 
@@ -39,7 +39,11 @@ async def call_ended(
         f"| call_id={payload.resolved_call_id()!r} customer={payload.resolved_customer_name()!r} "
         f"phone={payload.resolved_customer_phone()!r} order={payload.order_number!r} "
         f"items={str(payload.order_items)[:300]!r} total={payload.total_price!r} "
-        f"fulfillment={payload.fulfillment_type!r} disposition={payload.resolved_disposition()!r}"
+        f"fulfillment={payload.fulfillment_type!r} disposition={payload.resolved_disposition()!r} "
+        f"prov={payload.resolved_provider()!r} pcall={payload.resolved_provider_call_id()!r} "
+        f"gen={payload.genesys_conversation_id!r} "
+        f"ictx={ctx_key_summary(payload.initial_context)} "
+        f"gctx={ctx_key_summary(payload.gathered_context)}"
     )
     call_id = payload.resolved_call_id() or "unknown"
     existing = (
@@ -131,6 +135,42 @@ async def call_ended(
         if not (existing.first_name or "").strip() and payload.resolved_first_name():
             existing.first_name = payload.resolved_first_name()
             updated_fields.append("first_name")
+        # Provider-ID backfill on retry/late webhooks: the row may hold the
+        # Genesys *session* id from a live tool call while call-ended carries
+        # the *conversation* id (the canonical Provider ID). Realign it here
+        # instead of keeping the stale session id forever.
+        try:
+            from app.routers.tools import _resolve_provider_from_contexts as _ctx_prov2
+            _rprov2, _rpid2, _rgen2 = _ctx_prov2(
+                payload.resolved_provider(), payload.resolved_provider_call_id(),
+                payload.initial_context, payload.gathered_context)
+            _in_gen2 = (payload.genesys_conversation_id or "").strip() or _rgen2
+            if _in_gen2 and _rprov2 == "dograh":
+                _rprov2 = "genesys"
+            if _in_gen2 and not _rpid2:
+                _rpid2 = _in_gen2[:128]
+            if _rprov2 and (not (existing.provider or "").strip() or existing.provider == "dograh"):
+                existing.provider = _rprov2[:32]
+                updated_fields.append("provider")
+            if _in_gen2 and not (existing.genesys_conversation_id or "").strip():
+                existing.genesys_conversation_id = _in_gen2[:64]
+                updated_fields.append("genesys_conversation_id")
+            if _rpid2:
+                _cur_pid2 = (existing.provider_call_id or "").strip()
+                if not _cur_pid2:
+                    existing.provider_call_id = _rpid2[:128]
+                    updated_fields.append("provider_call_id")
+                elif (existing.provider or "") == "genesys" and _cur_pid2 != _rpid2:
+                    # Stored session id → realign to the conversation id.
+                    existing.provider_call_id = _rpid2[:128]
+                    updated_fields.append("provider_call_id")
+        except Exception as e:
+            logger.warning(f"call {call_id!r}: provider backfill failed ({e})")
+        if any(f in updated_fields for f in ("provider", "provider_call_id", "genesys_conversation_id")):
+            logger.info(
+                f"call {call_id!r}: provider realigned "
+                f"prov={existing.provider!r} pcall={(existing.provider_call_id or '')[:36]!r} "
+                f"gen={(existing.genesys_conversation_id or '')[:36]!r}")
         if payload.initial_context:
             merged = dict(existing.initial_context or {})
             # Merge (not overwrite): the row may predate the webhook, but the
@@ -214,6 +254,11 @@ async def call_ended(
     genesys_id = payload.genesys_conversation_id or _ctx_genesys or (
         provider_call_id if provider == "genesys" else ""
     )
+    if genesys_id and provider == "dograh":
+        # A Genesys conversation id without an explicit provider flag still
+        # means this call ran over Genesys — tag it so Provider ID lookups
+        # and filters treat provider_call_id as the conversation id.
+        provider = "genesys"
     if provider == "genesys" and not provider_call_id:
         provider_call_id = genesys_id
 
@@ -405,14 +450,30 @@ async def _materialize_order(
     ft = (p.fulfillment_type or "").lower()
     if ft in ("dinein", "dine_in", "dine-in"):
         order_type = "dinein"
+    # Resolve the order's provider ids the same way calls do: the HTTP tools
+    # often leave provider fields empty while initial_context carries
+    # {"provider": "genesys", "conversation_id": ...}. The conversation id
+    # is the Provider ID — never the session id.
+    try:
+        from app.routers.tools import _resolve_provider_from_contexts as _ctx_prov3
+        _oprov, _opid, _ogen = _ctx_prov3(
+            p.resolved_provider(), p.resolved_provider_call_id(),
+            p.initial_context, p.gathered_context)
+        _pgen = (p.genesys_conversation_id or "").strip() or _ogen
+        if _pgen and _oprov == "dograh":
+            _oprov = "genesys"
+        if _pgen and not _opid:
+            _opid = _pgen[:128]
+    except Exception:
+        _oprov, _opid = p.resolved_provider(), p.resolved_provider_call_id()
     if order:
         order.status = "confirmed" if p.order_completed or p.order_confirmed else order.status
         order.total = Decimal(str(p.total_price)) if p.total_price else order.total
         if not order.call_id and call_id and call_id != "unknown":
             order.call_id = call_id
-        if not order.provider_call_id and p.resolved_provider_call_id():
-            order.provider = p.resolved_provider()
-            order.provider_call_id = p.resolved_provider_call_id()
+        if not order.provider_call_id and _opid:
+            order.provider = _oprov
+            order.provider_call_id = _opid
         if p.delivery_address and not order.delivery_address:
             order.delivery_address = p.delivery_address
         if p.payment_method and not order.payment_method:
@@ -431,8 +492,8 @@ async def _materialize_order(
         total=Decimal(str(p.total_price)) if p.total_price else Decimal("0"),
         source="voice_agent",
         call_id=call_id,
-        provider=p.resolved_provider(),
-        provider_call_id=p.resolved_provider_call_id(),
+        provider=_oprov,
+        provider_call_id=_opid,
     )
     db.add(order)
     await db.flush()
@@ -686,6 +747,18 @@ async def transfer(payload: TransferWebhook, db: AsyncSession = Depends(get_db))
     reason = payload.resolved_reason()
     customer_name = payload.resolved_customer_name()
     customer_phone = payload.resolved_customer_phone()
+    # Provider chain: the Genesys conversation id is the canonical Provider
+    # ID (never the session id). Resolved the same way as tool calls so a
+    # mid-call handoff can already pin it before call-ended arrives.
+    from app.routers.tools import _resolve_provider_from_contexts as _ctx_prov_t
+    _tprov, _tpid, _tgen = _ctx_prov_t(
+        payload.resolved_provider(), payload.resolved_provider_call_id(),
+        payload.initial_context, payload.gathered_context)
+    _tgen = payload.resolved_genesys_id() or _tgen
+    if _tgen and _tprov == "dograh":
+        _tprov = "genesys"
+    if _tgen and not _tpid:
+        _tpid = _tgen[:128]
     if not reason:
         logger.warning(
             f"POST /api/webhooks/transfer ignored (empty reason) | call_id={call_id!r} — "
@@ -710,6 +783,11 @@ async def transfer(payload: TransferWebhook, db: AsyncSession = Depends(get_db))
             tool_calls=[],
             order_numbers=[],
             escalation_reason=reason,
+            provider=_tprov,
+            provider_call_id=_tpid,
+            genesys_conversation_id=_tgen,
+            initial_context=payload.initial_context or {},
+            gathered_context=payload.gathered_context or {},
         )
         db.add(call)
         try:
@@ -732,6 +810,16 @@ async def transfer(payload: TransferWebhook, db: AsyncSession = Depends(get_db))
         call.customer_name = customer_name
     if customer_phone and not (call.customer_phone or "").strip():
         call.customer_phone = customer_phone
+    if _tprov and (not (call.provider or "").strip() or call.provider == "dograh"):
+        call.provider = _tprov[:32]
+    if _tgen and not (call.genesys_conversation_id or "").strip():
+        call.genesys_conversation_id = _tgen[:64]
+    if _tpid:
+        _cur = (call.provider_call_id or "").strip()
+        if not _cur:
+            call.provider_call_id = _tpid[:128]
+        elif call.provider == "genesys" and _cur != _tpid:
+            call.provider_call_id = _tpid[:128]
     if not (call.summary or "").strip():
         # No summary yet (transfer arrived before call end) — write a
         # short handoff line so Agent View has something; call-ended
@@ -770,6 +858,9 @@ async def transfer(payload: TransferWebhook, db: AsyncSession = Depends(get_db))
             }
 
     await db.commit()
-    logger.info(f"POST /api/webhooks/transfer | call_id={call_id!r} reason={reason!r}")
+    logger.info(
+        f"POST /api/webhooks/transfer | call_id={call_id!r} reason={reason!r} "
+        f"prov={call.provider!r} pcall={(call.provider_call_id or '')[:36]!r} "
+        f"gen={(call.genesys_conversation_id or '')[:36]!r}")
     return TransferContextResponse(call_id=call_id, recorded=True,
                                    agent_context=agent_context)

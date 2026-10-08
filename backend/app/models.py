@@ -255,3 +255,20 @@ class LangfuseSetting(Base):
     project_id: Mapped[str] = mapped_column(String(128), default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class AppUser(Base):
+    """Mock dashboard user (register/signin only — no API enforcement).
+
+    The voice-agent tool + webhook APIs stay open (the Dograh API key lives
+    in the tool call / integration settings, not in a user session), so this
+    table only gates the dashboard UI.
+    """
+
+    __tablename__ = "app_users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email: Mapped[str] = mapped_column(String(256), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(128), default="")
+    password_hash: Mapped[str] = mapped_column(String(256), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

@@ -4,6 +4,7 @@ import { Toaster } from "@/components/ui/sonner";
 import { BrandLogo } from "@/components/brand-logo";
 import { SideNav } from "@/components/side-nav";
 import { MobileNav } from "@/components/mobile-nav";
+import { AuthProvider, AuthGuard } from "@/components/auth";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -28,6 +29,8 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
+        <AuthProvider>
+        <AuthGuard>
         <div className="flex h-screen overflow-hidden">
           {/* Fixed sidebar — never scrolls with the page */}
           <aside className="sticky top-0 hidden h-screen w-64 shrink-0 flex-col bg-[#000E49] shadow-xl md:flex">
@@ -69,6 +72,8 @@ export default function RootLayout({
             </div>
           </main>
         </div>
+        </AuthGuard>
+        </AuthProvider>
         <Toaster richColors />
       </body>
     </html>

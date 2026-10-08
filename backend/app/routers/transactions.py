@@ -320,10 +320,16 @@ async def backfill_provider_ids(db: AsyncSession = Depends(get_db)):
         conv = ""
         for _scope in ctx_scopes:
             if isinstance(_scope, dict):
-                for _k in ("conversation_id", "conversationId"):
-                    _v = _scope.get(_k)
-                    if isinstance(_v, str) and _v.strip() and "{{" not in _v:
-                        conv = _v.strip()[:64]
+                _nested: list[dict] = [_scope] + [
+                    v for v in _scope.values() if isinstance(v, dict)]
+                for _s in _nested:
+                    for _k in ("conversation_id", "conversationId",
+                               "genesys_conversation_id", "genesysConversationId"):
+                        _v = _s.get(_k)
+                        if isinstance(_v, str) and _v.strip() and "{{" not in _v:
+                            conv = _v.strip()[:64]
+                            break
+                    if conv:
                         break
             if conv:
                 break

@@ -48,6 +48,29 @@ def coerce_bool(v: Any) -> bool:
     return bool(s) and s not in ("0", "false")
 
 
+def ctx_key_summary(scope: Any) -> str:
+    """One-line shape of a context dict for api logs (keys only, no values).
+
+    Shows whether an id (e.g. conversation_id) arrived at all, without
+    leaking PII into the logs. Nested dicts render as key{subkeys}.
+    """
+    if not isinstance(scope, dict):
+        return "{}"
+    top = sorted(str(k) for k in scope.keys())
+    bits: list[str] = []
+    for k in top[:15]:
+        v = scope[k]
+        if isinstance(v, dict):
+            sub = sorted(str(kk) for kk in v.keys())[:12]
+            bits.append(f"{k}{{{','.join(sub)}}}")
+        else:
+            bits.append(str(k))
+    s = ",".join(bits)
+    if len(top) > 15:
+        s += f",+{len(top) - 15}more"
+    return "{" + s + "}"
+
+
 # ---------- Agent tool payloads ----------
 
 class OrderItemIn(BaseModel):
@@ -164,6 +187,10 @@ class OrderCreateRequest(BaseModel):
     provider: Optional[str] = ""
     provider_call_id: Optional[str] = ""
     telephony_id: Optional[str] = ""
+    # Explicit Genesys conversation id (the canonical Provider ID). Accepts
+    # top-level conversation_id / conversationId spellings too, so a Dograh
+    # preset can map the session-created conversation id straight in.
+    genesys_conversation_id: Optional[str] = ""
     # --- Dograh webhook context (all optional, also accepted on order-status) ---
     workflow_run_id: Optional[str] = ""
     first_name: Optional[str] = ""
@@ -233,6 +260,12 @@ class OrderCreateRequest(BaseModel):
             "provider id": "provider_call_id",
             "call sid": "provider_call_id",
             "twilio sid": "provider_call_id",
+            "conversation_id": "genesys_conversation_id",
+            "conversationid": "genesys_conversation_id",
+            "conversation id": "genesys_conversation_id",
+            "genesys_conversation_id": "genesys_conversation_id",
+            "genesysconversationid": "genesys_conversation_id",
+            "genesys conversation id": "genesys_conversation_id",
             "first name": "first_name",
             "user recording url": "user_recording_url",
             "bot recording url": "bot_recording_url",
@@ -349,7 +382,8 @@ class OrderCreateRequest(BaseModel):
             return ""
         return s
 
-    @field_validator("provider", "provider_call_id", "telephony_id", mode="before")
+    @field_validator("provider", "provider_call_id", "telephony_id",
+                      "genesys_conversation_id", mode="before")
     @classmethod
     def _coerce_provider_fields(cls, v: Any) -> Any:
         if v is None:
@@ -408,6 +442,9 @@ class OrderCreateRequest(BaseModel):
 
     def resolved_provider_call_id(self) -> str:
         return clean_str(self.provider_call_id or self.telephony_id)[:128]
+
+    def resolved_genesys_id(self) -> str:
+        return clean_str(self.genesys_conversation_id)[:64]
 
     def resolved_duration(self) -> int:
         try:
@@ -1009,6 +1046,15 @@ class TransferWebhook(BaseModel):
     customer_name: Optional[str] = ""
     customer_phone: Optional[str] = ""
     phone: Optional[str] = ""
+    # Optional provider chain so a mid-call handoff can already pin the
+    # Genesys conversation id (the canonical Provider ID) before call-ended
+    # arrives. Accepts the same spellings as the tool/webhook payloads.
+    provider: Optional[str] = ""
+    provider_call_id: Optional[str] = ""
+    telephony_id: Optional[str] = ""
+    genesys_conversation_id: Optional[str] = ""
+    initial_context: dict[str, Any] = {}
+    gathered_context: dict[str, Any] = {}
 
     @model_validator(mode="before")
     @classmethod
@@ -1039,6 +1085,12 @@ class TransferWebhook(BaseModel):
             "customer name": "customer_name",
             "name": "customer_name",
             "first name": "customer_name",
+            "telephony id": "provider_call_id",
+            "telephony_id": "provider_call_id",
+            "provider call id": "provider_call_id",
+            "provider_call_id": "provider_call_id",
+            "provider id": "provider_call_id",
+            "call sid": "provider_call_id",
         }
         normalized = {str(k).strip().lower().replace("-", " "): v for k, v in data.items()}
         for alias, canonical in aliases.items():
@@ -1049,7 +1101,9 @@ class TransferWebhook(BaseModel):
     @field_validator("call_id", "workflow_run_id", "reason",
                      "transfer_reason", "transfer_requested_reason",
                      "reason_for_transfer", "escalation_reason",
-                     "customer_name", "customer_phone", "phone", mode="before")
+                     "customer_name", "customer_phone", "phone",
+                     "provider", "provider_call_id", "telephony_id",
+                     "genesys_conversation_id", mode="before")
     @classmethod
     def _coerce_strs(cls, v: Any) -> Any:
         if v is None:
@@ -1060,6 +1114,22 @@ class TransferWebhook(BaseModel):
         if s.startswith("<") and s.endswith(">"):
             return ""
         return s
+
+    @field_validator("initial_context", "gathered_context", mode="before")
+    @classmethod
+    def _coerce_contexts(cls, v: Any) -> Any:
+        if isinstance(v, dict):
+            return v
+        if v in (None, "") or is_unresolved_template(v):
+            return {}
+        if isinstance(v, str):
+            import json
+            try:
+                parsed = json.loads(v.strip())
+                return parsed if isinstance(parsed, dict) else {}
+            except (json.JSONDecodeError, ValueError, AttributeError):
+                return {}
+        return {}
 
     def resolved_call_id(self) -> str:
         return (self.call_id or self.workflow_run_id or "").strip()
@@ -1078,6 +1148,21 @@ class TransferWebhook(BaseModel):
 
     def resolved_customer_name(self) -> str:
         return clean_str(self.customer_name)
+
+    def resolved_provider(self) -> str:
+        p = clean_str(self.provider).lower() or "dograh"
+        return p[:32]
+
+    def resolved_provider_call_id(self) -> str:
+        for cand in (self.provider_call_id, self.telephony_id,
+                     self.genesys_conversation_id):
+            s = clean_str(cand)
+            if s:
+                return s[:128]
+        return ""
+
+    def resolved_genesys_id(self) -> str:
+        return clean_str(self.genesys_conversation_id)[:64]
 
 
 class TransferContextResponse(BaseModel):

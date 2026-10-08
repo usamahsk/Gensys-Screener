@@ -10,7 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { PageHeader } from "@/components/page-header";
 import { apiClient, type KnowledgeDocument } from "@/lib/api";
 import { toast } from "sonner";
-import { BookOpen, Loader2, RefreshCw, Trash2, UploadCloud } from "lucide-react";
+import { BookOpen, Download, Loader2, RefreshCw, Trash2, UploadCloud } from "lucide-react";
 
 const ACCEPT = ".pdf,.docx,.doc,.txt,.json";
 
@@ -164,7 +164,7 @@ export default function KnowledgeBasePage() {
                   <TableHead>Mode</TableHead>
                   <TableHead className="text-right">Chunks</TableHead>
                   <TableHead>Updated</TableHead>
-                  <TableHead className="w-16"></TableHead>
+                  <TableHead className="w-28"></TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -190,9 +190,20 @@ export default function KnowledgeBasePage() {
                       {new Date(d.updated_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
                     </TableCell>
                     <TableCell>
-                      <Button size="sm" variant="ghost" title="Delete" onClick={() => remove(d.document_uuid, d.filename)}>
-                        <Trash2 className="h-4 w-4 text-red-600" />
-                      </Button>
+                      <div className="flex items-center justify-end gap-1">
+                        <a
+                          href={apiClient.knowledgeDocDownloadUrl(d.document_uuid)}
+                          download={d.filename}
+                          title={`Download ${d.filename} to this machine`}
+                        >
+                          <Button size="sm" variant="ghost" title="Download">
+                            <Download className="h-4 w-4 text-[#0068FF]" />
+                          </Button>
+                        </a>
+                        <Button size="sm" variant="ghost" title="Delete" onClick={() => remove(d.document_uuid, d.filename)}>
+                          <Trash2 className="h-4 w-4 text-red-600" />
+                        </Button>
+                      </div>
                     </TableCell>
                   </TableRow>
                 ))}

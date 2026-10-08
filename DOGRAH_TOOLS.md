@@ -42,6 +42,7 @@ Parameters:
 | call_id        | string | no       | Preset parameter `{{workflow_run_id}}` (see note below) |
 | provider       | string | no       | Preset `dograh` (or `genesys`) — stored as the provider column |
 | provider_call_id | string | no     | Preset telephony/SIP Call SID from your telephony provider (Twilio/Vonage/Plivo/Telnyx) — stored as the telephony ID, the Dograh flavour of the Genesys conversation id. Aliases accepted: `telephony_id`, `telephony_call_id`, `call_sid` |
+| genesys_conversation_id | string | no | **Genesys only:** preset the conversation id straight from the session-created log (e.g. `{{initial_context.audiohook.conversationId}}` — check your workflow's variable panel for the exact path; `conversation_id` / `conversationId` spellings also accepted). Stored as both Provider ID and Genesys conversation id, overriding any session id. |
 | first_name     | string | no       | Preset `{{initial_context.first_name}}` — stored on the call log |
 | rsvp           | string | no       | Preset `{{gathered_context.rsvp}}` — stored on the call log |
 | duration       | number | no       | Preset `{{cost_info.call_duration_seconds}}` — stored on the call log |
@@ -89,6 +90,23 @@ Sample request (all fields):
 > `call_sid` all work. This is the Dograh equivalent of the Genesys
 > conversation id, and it shows up as **Provider / Telephony ID** columns in
 > Runs, Orders and Call Logs, plus the Excel reports.
+>
+> **Genesys — Provider ID must be the conversation id:** when `provider` is
+> `genesys`, `provider_call_id` must be the Genesys **conversation id**
+> (`conversation_id` / `conversationId`) — never the AudioHook `session_id` /
+> `correlation_id`. Send any ONE of these and the backend stores it as both
+> Provider ID and Genesys conversation id (top-level wins, context fallback):
+> `genesys_conversation_id`, `provider_call_id` (= conversation id),
+> `initial_context: {"provider": "genesys", "conversation_id": "..."}`,
+> or the same inside `gathered_context` (`conversationId` spelling also
+> works). A bare `genesys_conversation_id` alone is enough — the provider is
+> inferred as `genesys`. Nested blocks are scanned too, so the
+> `conversationId` from Dograh's session-created log (e.g.
+> `initial_context.audiohook.conversationId`) is picked up as long as you
+> pass the whole contexts through (`"initial_context": "{{initial_context}}"`,
+> `"gathered_context": "{{gathered_context}}"` on tools and the webhook).
+> If a live tool call stored the session id first, the
+> later `call-ended` with the conversation id realigns it automatically.
 
 Sample response (201):
 ```json
@@ -268,6 +286,61 @@ Response: `201` with the stored memory object.
 
 ---
 
+## Tool 5 — `log_inputs` (dummy / capture-only, no order)
+
+**Method:** `POST`  **URL:** `<BASE>/api/tools/log-call`
+
+Header: `Content-Type: application/json`
+
+For setups **not** using `create_order`: records whatever inputs the agent
+gathered on the Call Logs row (tool name + args summary + contexts + provider
+chain) and creates **no order row**. Use it to see the tool call with its
+inputs in Transactions → Call Logs. Never 422s — an empty body or a missing
+`call_id` returns a message instead of failing the call.
+
+Parameters (all optional):
+
+| name         | type   | required | description for the LLM |
+|--------------|--------|----------|--------------------------|
+| call_id | string | no | Preset `{{workflow_run_id}}` — without it nothing is logged (`logged: false`) |
+| tool_name | string | no | Name shown in Call Logs, e.g. `capture_inputs` (default `capture`) |
+| inputs | object/string | no | The gathered inputs (dict, list or text) — stored as the args summary. Aliases: `input`, `args`, `arguments`, `data`, `params`, `parameters` |
+| customer_phone | string | no | Preset/customer phone (alias `phone`) |
+| provider | string | no | Preset `dograh` (or `genesys`) |
+| genesys_conversation_id | string | no | Genesys conversation id preset (aliases `conversation_id`, `conversationId`) — stored as Provider ID |
+| initial_context | object | no | Preset `{{initial_context}}` — stored on the call log |
+| gathered_context | object | no | Preset `{{gathered_context}}` — stored on the call log |
+
+Sample request:
+```json
+{
+  "call_id": "{{workflow_run_id}}",
+  "tool_name": "capture_inputs",
+  "inputs": {"phone": "{{initial_context.phone}}", "intent": "order_status"},
+  "provider": "genesys",
+  "genesys_conversation_id": "{{initial_context.audiohook.conversationId}}",
+  "initial_context": "{{initial_context}}",
+  "gathered_context": "{{gathered_context}}"
+}
+```
+
+Sample response (201):
+```json
+{
+  "status": "logged",
+  "logged": true,
+  "call_id": "411d1ded-a951-4621-97ca-04209bfa0d6a",
+  "tool": "capture_inputs",
+  "provider": "genesys",
+  "provider_call_id": "eddc6f71-2819-4f69-8bd8-91e5ec8c0ba8",
+  "genesys_conversation_id": "eddc6f71-2819-4f69-8bd8-91e5ec8c0ba8",
+  "message": "Inputs recorded for call 411d1ded-a951-4621-97ca-04209bfa0d6a — no order created."
+}
+```
+The echoed `provider_call_id` / `genesys_conversation_id` confirm the
+conversation-id mapping straight from the Dograh response — no dashboard
+round-trip needed.
+
 ## Next order number (sequential — fetch at call start)
 
 **Method:** `POST` (prefetch-safe) or `GET`  **URL:** `<BASE>/api/orders/next-number`
@@ -332,6 +405,9 @@ To make the spoken number and the stored order identical:
   "disposition": "completed",
   "customer_name": "Rohan Mehta",
   "customer_phone": "+919812345670",
+  "genesys_conversation_id": "{{initial_context.conversation_id}}",
+  "initial_context": "{{initial_context}}",
+  "gathered_context": "{{gathered_context}}",
   "transcript": [ { "role": "customer", "content": "..." }, { "role": "assistant", "content": "..." } ],
   "tool_calls": [ { "name": "create_order", "args_summary": "Pepperoni Large x1" } ],
   "order_numbers": ["PB-1382"]

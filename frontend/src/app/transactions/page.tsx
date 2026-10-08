@@ -197,8 +197,14 @@ function downloadTextFile(filename: string, text: string) {
   setTimeout(() => URL.revokeObjectURL(objUrl), 1000);
 }
 
-function turnsToText(turns: { role: string; content: string }[]) {
-  return turns.map((t) => `${t.role}: ${t.content}`).join("\n");
+function turnsToText(turns: { role: string; content: string; time?: string }[]) {
+  // Saved turns only carry a timestamp when the raw log had an inline
+  // "[ISO-ts] role:" marker — most webhook turns have none, so the file
+  // omits it rather than inventing one. For the untouched Dograh log, use
+  // the raw transcript text instead (see Download button below).
+  return turns
+    .map((t) => (t.time ? `[${t.time}] ${t.role}: ${t.content}` : `${t.role}: ${t.content}`))
+    .join("\n");
 }
 
 function isProviderSid(id: string) {
@@ -1195,14 +1201,18 @@ export default function TransactionsPage() {
                       Conversation
                       {turns.length > 0 && <Badge variant="outline" className="ml-1">{turns.length} turns</Badge>}
                     </span>
-                    {turns.length > 0 && (
+                    {(typeof runEvidence?.transcript === "string" && runEvidence.transcript.trim() ? true : turns.length > 0) && (
                       <Button
                         size="sm"
                         variant="outline"
                         onClick={() =>
                           downloadTextFile(
                             `transcript-${selected.call?.call_id || "call"}.txt`,
-                            turnsToText(turns)
+                            // Raw Dograh log as-is (with its own timestamps)
+                            // when linked; rebuilt turns text otherwise.
+                            (typeof runEvidence?.transcript === "string" && runEvidence.transcript.trim()
+                              ? runEvidence.transcript
+                              : turnsToText(turns))
                           )
                         }
                       >

@@ -405,6 +405,8 @@ export const apiClient = {
       `/api/integration/dograh/knowledge-base/${encodeURIComponent(uuid)}`,
       { method: "DELETE" }
     ),
+  knowledgeDocDownloadUrl: (uuid: string) =>
+    `${API_URL}/api/integration/dograh/knowledge-base/${encodeURIComponent(uuid)}/download`,
   uploadKnowledgeDoc: async (file: File, retrievalMode = "chunked") => {
     const form = new FormData();
     form.append("file", file);

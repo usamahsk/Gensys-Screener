@@ -23,6 +23,8 @@ from app.schemas import (
     OrderItemOut,
     OrderStatusResponse,
     clean_str,
+    ctx_key_summary,
+    is_unresolved_template,
 )
 from app.services.embeddings import embed_one
 
@@ -100,8 +102,11 @@ async def _resolve_order_number(db: AsyncSession, requested: object) -> str:
 # Key groups are searched in order ACROSS all scopes, so a conversation id in
 # gathered_context beats a session id in initial_context.
 _CTX_PROVIDER_KEYS = ("provider", "telephony_provider", "call_provider")
-_CTX_CONVERSATION_KEYS = ("conversation_id", "conversationId")
-_CTX_SESSION_KEYS = ("session_id", "correlation_id")
+_CTX_CONVERSATION_KEYS = ("conversation_id", "conversationId",
+                          "genesys_conversation_id", "genesysConversationId")
+_CTX_SESSION_KEYS = ("session_id", "sessionId", "correlation_id", "correlationId",
+                     "genesys_session_id", "genesysSessionId",
+                     "genesys_correlation_id", "genesysCorrelationId")
 _CTX_OTHER_TELEPHONY_KEYS = (
     "provider_call_id", "telephony_id", "telephony_call_id", "call_sid",
     "telephony_call_sid", "twilio_sid", "twilio_call_sid", "vonage_uuid",
@@ -114,13 +119,36 @@ _CTX_TELEPHONY_KEYS = (
     *_CTX_SESSION_KEYS, "call_id",
 )
 _CTX_GENESYS_KEYS = (
-    "conversation_id", "conversationId", "correlation_id", "session_id",
+    "conversation_id", "conversationId",
+    "genesys_conversation_id", "genesysConversationId",
+    "correlation_id", "correlationId", "session_id", "sessionId",
+    "genesys_session_id", "genesysSessionId",
+    "genesys_correlation_id", "genesysCorrelationId",
 )
+
+
+def _expand_scopes(scopes: list[dict]) -> list[dict]:
+    """Top-level scopes plus one level of nested dicts.
+
+    Dograh nests the Genesys ids (e.g. initial_context.audiohook =
+    {conversationId, sessionId, ...} from the session-created log), so a
+    flat key scan misses them. One extra level is enough and keeps the
+    search deterministic.
+    """
+    out: list[dict] = []
+    for scope in scopes:
+        if not isinstance(scope, dict):
+            continue
+        out.append(scope)
+        for v in scope.values():
+            if isinstance(v, dict):
+                out.append(v)
+    return out
 
 
 def _ctx_lookup(scopes: list[dict], keys: tuple[str, ...]) -> str:
     """First non-empty, non-template value for any key across scopes."""
-    for scope in scopes:
+    for scope in _expand_scopes(scopes):
         if not isinstance(scope, dict):
             continue
         lowered = {str(k).strip().lower(): v for k, v in scope.items()}
@@ -215,6 +243,7 @@ async def _log_tool_call(
     initial_context: dict | None = None,
     gathered_context: dict | None = None,
     customer_intent: str = "",
+    genesys_conversation_id: str = "",
 ) -> Call | None:
     """Create or update the Call Logs row for this tool call.
 
@@ -227,6 +256,7 @@ async def _log_tool_call(
     call_id = (call_id or "").strip()
     if not call_id:
         return None
+    call_type = (call_type or "").strip()[:16]
     if not (call_purpose or "").strip():
         # Older callers only send call_type — derive the filter purpose.
         call_purpose = {"create_order": "order_creation",
@@ -250,6 +280,15 @@ async def _log_tool_call(
         call_purpose = call_purpose or norm_intent
     provider, provider_call_id, _genesys = _resolve_provider_from_contexts(
         provider, provider_call_id, initial_context, gathered_context)
+    # Explicit top-level Genesys id (Dograh preset mapped straight from the
+    # session-created conversation id) beats anything inferred from contexts.
+    _explicit_gen = (genesys_conversation_id or "").strip()
+    if _explicit_gen:
+        _genesys = _explicit_gen[:64]
+        if provider == "dograh":
+            provider = "genesys"
+        if not provider_call_id or (provider == "genesys" and provider_call_id != _genesys):
+            provider_call_id = _genesys[:128]
     call = (
         await db.execute(select(Call).where(Call.call_id == call_id))
     ).scalar_one_or_none()
@@ -389,7 +428,11 @@ async def create_order(
         f"POST /api/tools/orders from {request.client.host if request.client else '?'} "
         f"| phone={req.customer_phone!r} name={req.customer_name!r} "
         f"type={req.order_type!r} items={len(req.items)} total={req.total!r} "
-        f"call_id={req.resolved_call_id()!r}"
+        f"call_id={req.resolved_call_id()!r} "
+        f"prov={req.resolved_provider()!r} pcall={req.resolved_provider_call_id()!r} "
+        f"gen={req.resolved_genesys_id()!r} "
+        f"ictx={ctx_key_summary(req.resolved_initial_context())} "
+        f"gctx={ctx_key_summary(req.resolved_gathered_context())}"
     )
     if not req.customer_phone.strip() or not req.items:
         # Debug aid: log the raw top-level keys Dograh actually sent so an
@@ -432,11 +475,11 @@ async def create_order(
             initial_context=req.resolved_initial_context(),
             gathered_context=req.resolved_gathered_context(),
             customer_intent=req.resolved_customer_intent() or "order_creation",
+            genesys_conversation_id=req.resolved_genesys_id(),
         )
         await db.commit()
         return OrderCreatedResponse(
-            order_number="", total=D("0"), status="pending", items=[],
-            message=(
+            order_number="", total=D("0"), status="pending", items=[],            message=(
                 f"Order noted but incomplete (missing: {', '.join(missing)}). "
                 "Do NOT read out any order number to the customer — none was "
                 "created. Collect the missing details and call create_order "
@@ -460,6 +503,14 @@ async def create_order(
         total = round(total + DELIVERY_FEE, 2)
 
     order_number = await _resolve_order_number(db, req.order_number)
+    _ord_prov, _ord_pid, _ord_gen = _resolve_provider_from_contexts(
+        req.resolved_provider(), req.resolved_provider_call_id(),
+        req.resolved_initial_context(), req.resolved_gathered_context())
+    _ord_gen = req.resolved_genesys_id() or _ord_gen
+    if _ord_gen and _ord_prov == "dograh":
+        _ord_prov = "genesys"
+    if _ord_gen and not _ord_pid:
+        _ord_pid = _ord_gen[:128]
     order = Order(
         order_number=order_number,
         customer_name=req.customer_name.strip(),
@@ -473,8 +524,8 @@ async def create_order(
         status="confirmed",
         total=D(str(round(total, 2))),
         call_id=req.resolved_call_id(),
-        provider=req.resolved_provider(),
-        provider_call_id=req.resolved_provider_call_id(),
+        provider=_ord_prov,
+        provider_call_id=_ord_pid,
     )
     db.add(order)
     await db.flush()
@@ -545,6 +596,7 @@ async def create_order(
         initial_context=req.resolved_initial_context(),
         gathered_context=req.resolved_gathered_context(),
         customer_intent=req.resolved_customer_intent() or "order_placement",
+        genesys_conversation_id=req.resolved_genesys_id(),
     )
 
     await db.commit()
@@ -590,6 +642,7 @@ class OrderStatusLookupRequest(BaseModel):
     telephony_id: Optional[Any] = ""
     telephony_call_id: Optional[Any] = ""
     call_sid: Optional[Any] = ""
+    genesys_conversation_id: Optional[Any] = ""
     first_name: Optional[Any] = ""
     rsvp: Optional[Any] = ""
     duration: Optional[Any] = 0
@@ -631,6 +684,12 @@ class OrderStatusLookupRequest(BaseModel):
             "provider id": "provider_call_id",
             "call sid": "provider_call_id",
             "first name": "first_name",
+            "conversation_id": "genesys_conversation_id",
+            "conversationid": "genesys_conversation_id",
+            "conversation id": "genesys_conversation_id",
+            "genesys_conversation_id": "genesys_conversation_id",
+            "genesysconversationid": "genesys_conversation_id",
+            "genesys conversation id": "genesys_conversation_id",
             "user recording url": "user_recording_url",
             "bot recording url": "bot_recording_url",
             "transcript url": "transcript_url",
@@ -669,6 +728,9 @@ class OrderStatusLookupRequest(BaseModel):
             if s:
                 return s[:128]
         return ""
+
+    def resolved_genesys_id(self) -> str:
+        return self._s(self.genesys_conversation_id)[:64]
 
     def resolved_duration(self) -> int:
         return _coerce_int(self.duration_seconds or self.duration)
@@ -849,6 +911,7 @@ async def order_status_post(req: OrderStatusLookupRequest, db: AsyncSession = De
         initial_context=req.resolved_initial_context(),
         gathered_context=req.resolved_gathered_context(),
         customer_intent=req.resolved_customer_intent(),
+        genesys_conversation_id=req.resolved_genesys_id(),
     )
     if order is not None and order.customer_phone:
         _cust = (await db.execute(
@@ -1008,6 +1071,7 @@ class ReservationLogRequest(BaseModel):
     provider: str = ""
     provider_call_id: str = ""
     telephony_id: str = ""
+    genesys_conversation_id: str = ""
     initial_context: dict | None = None
     gathered_context: dict | None = None
     customer_intent: str = ""
@@ -1056,6 +1120,7 @@ async def log_reservation(req: ReservationLogRequest, db: AsyncSession = Depends
         initial_context=req.initial_context or {},
         gathered_context=req.gathered_context or {},
         customer_intent=(req.customer_intent or "reservation")[:64],
+        genesys_conversation_id=clean_str(req.genesys_conversation_id),
     )
     _phone = clean_str(req.customer_phone)
     if _phone:
@@ -1078,6 +1143,189 @@ def _coerce_int(v: object) -> int:
         return int(float(str(v)))
     except (ValueError, TypeError):
         return 0
+
+
+# --------------------------------------------------------------- dummy log
+# (input capture without ordering — for setups not using create_order)
+
+class LogCallRequest(BaseModel):
+    """Dummy/log-only tool call: records inputs on the Call Logs row and
+    creates NO order row. Dograh-safe: every field optional, stray-space keys
+    + common aliases mapped, {{...}} unresolved literals tolerated.
+
+    Configure in Dograh as HTTP API tool: POST <BASE>/api/tools/log-call.
+    The response echoes the resolved provider chain so you can verify the
+    Genesys conversation id mapping straight from the Dograh response.
+    """
+
+    model_config = {"extra": "ignore", "populate_by_name": True}
+
+    call_id: Optional[Any] = ""
+    workflow_run_id: Optional[Any] = ""
+    tool_name: Optional[Any] = "capture"
+    inputs: Optional[Any] = None
+    customer_name: Optional[Any] = ""
+    customer_phone: Optional[Any] = ""
+    phone: Optional[Any] = ""
+    first_name: Optional[Any] = ""
+    rsvp: Optional[Any] = ""
+    duration: Optional[Any] = 0
+    duration_seconds: Optional[Any] = 0
+    recording_url: Optional[Any] = ""
+    user_recording_url: Optional[Any] = ""
+    bot_recording_url: Optional[Any] = ""
+    transcript_url: Optional[Any] = ""
+    provider: Optional[Any] = ""
+    provider_call_id: Optional[Any] = ""
+    telephony_id: Optional[Any] = ""
+    genesys_conversation_id: Optional[Any] = ""
+    initial_context: Optional[Any] = None
+    gathered_context: Optional[Any] = None
+    customer_intent: Optional[Any] = ""
+    call_purpose: Optional[Any] = ""
+
+    @model_validator(mode="before")  # type: ignore[misc]
+    @classmethod
+    def _map_aliases(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        stripped: dict[str, Any] = {}
+        for k, v in data.items():
+            sk = str(k).strip()
+            if sk not in stripped:
+                stripped[sk] = v
+        aliases = {
+            "workflow run id": "call_id",
+            "workflow_run_id": "call_id",
+            "tool name": "tool_name",
+            "toolname": "tool_name",
+            "input": "inputs",
+            "args": "inputs",
+            "arguments": "inputs",
+            "data": "inputs",
+            "params": "inputs",
+            "parameters": "inputs",
+            "phone number": "customer_phone",
+            "customer phone number": "customer_phone",
+            "phone": "customer_phone",
+            "customer name": "customer_name",
+            "name": "customer_name",
+            "first name": "first_name",
+            "telephony id": "provider_call_id",
+            "telephony_id": "provider_call_id",
+            "provider call id": "provider_call_id",
+            "provider_call_id": "provider_call_id",
+            "provider id": "provider_call_id",
+            "call sid": "provider_call_id",
+            "conversation_id": "genesys_conversation_id",
+            "conversationid": "genesys_conversation_id",
+            "conversation id": "genesys_conversation_id",
+            "genesys_conversation_id": "genesys_conversation_id",
+            "genesysconversationid": "genesys_conversation_id",
+            "genesys conversation id": "genesys_conversation_id",
+            "user recording url": "user_recording_url",
+            "bot recording url": "bot_recording_url",
+            "transcript url": "transcript_url",
+        }
+        normalized = {str(k).strip().lower().replace("-", " "): v for k, v in stripped.items()}
+        for alias, canonical in aliases.items():
+            if alias in normalized and not stripped.get(canonical):
+                stripped[canonical] = normalized[alias]
+        return stripped
+
+    def _s(self, v: Any) -> str:
+        return clean_str(v)
+
+    def resolved_call_id(self) -> str:
+        return self._s(self.call_id or self.workflow_run_id)
+
+    def resolved_tool_name(self) -> str:
+        return self._s(self.tool_name)[:64] or "capture"
+
+    def resolved_inputs_summary(self) -> str:
+        ins = self.inputs
+        if ins in (None, "") or is_unresolved_template(ins):
+            return ""
+        if isinstance(ins, dict):
+            bits = [f"{k}={v}" for k, v in list(ins.items())[:12]]
+            s = ", ".join(bits)
+        elif isinstance(ins, list):
+            s = ", ".join(str(x) for x in ins[:12])
+        else:
+            s = str(ins)
+        return s[:500]
+
+    def _ctx(self, v: Any) -> dict:
+        if isinstance(v, dict):
+            return v
+        if isinstance(v, str) and v.strip():
+            import json as _json
+            try:
+                p = _json.loads(v.strip())
+                return p if isinstance(p, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+
+@router.post("/log-call", response_model=dict, status_code=201)
+async def log_tool_call(req: LogCallRequest, request: Request, db: AsyncSession = Depends(get_db)):
+    """Log-only tool call: stores inputs on the Call Logs row, no order row.
+
+    For setups not using create_order — lets you see exactly what inputs the
+    agent gathered (tool name + args summary + contexts + provider chain) in
+    Transactions → Call Logs. Never 422s: missing call_id just returns
+    logged=False with a message instead of failing the call.
+    """
+    call_id = req.resolved_call_id()
+    if not call_id or is_unresolved_template(call_id):
+        return {"status": "skipped", "logged": False, "call_id": "",
+                "message": "No call_id (preset {{workflow_run_id}}) — nothing was logged. "
+                           "Add call_id as a preset parameter with value {{workflow_run_id}}."}
+    tool_name = req.resolved_tool_name()
+    summary = req.resolved_inputs_summary() or "(no inputs)"
+    logger.info(
+        f"POST /api/tools/log-call from {request.client.host if request.client else '?'} "
+        f"| call_id={call_id!r} tool={tool_name!r} inputs={summary[:200]!r} "
+        f"prov={req._s(req.provider)!r} pcall={clean_str(req.provider_call_id or req.telephony_id)!r} "
+        f"gen={req._s(req.genesys_conversation_id)!r} "
+        f"ictx={ctx_key_summary(req._ctx(req.initial_context))} "
+        f"gctx={ctx_key_summary(req._ctx(req.gathered_context))}"
+    )
+    call = await _log_tool_call(
+        db,
+        call_id=call_id,
+        call_type="tool_log",
+        call_purpose=req._s(req.call_purpose),
+        customer_name=req._s(req.customer_name),
+        customer_phone=req._s(req.customer_phone or req.phone),
+        first_name=req._s(req.first_name),
+        rsvp=clean_str(req.rsvp),
+        duration=_coerce_int(req.duration_seconds or req.duration),
+        recording_url=clean_str(req.recording_url),
+        user_recording_url=clean_str(req.user_recording_url),
+        bot_recording_url=clean_str(req.bot_recording_url),
+        transcript_url=clean_str(req.transcript_url),
+        tool_name=tool_name,
+        tool_summary=summary,
+        provider=req._s(req.provider),
+        provider_call_id=clean_str(req.provider_call_id or req.telephony_id),
+        initial_context=req._ctx(req.initial_context),
+        gathered_context=req._ctx(req.gathered_context),
+        customer_intent=req._s(req.customer_intent),
+        genesys_conversation_id=req._s(req.genesys_conversation_id),
+    )
+    await db.commit()
+    return {
+        "status": "logged",
+        "logged": True,
+        "call_id": call_id,
+        "tool": tool_name,
+        "provider": (call.provider if call else "") or "",
+        "provider_call_id": (call.provider_call_id if call else "") or "",
+        "genesys_conversation_id": (call.genesys_conversation_id if call else "") or "",
+        "message": f"Inputs recorded for call {call_id} — no order created.",
+    }
 
 
 async def _lookup_order(order_number: str, db: AsyncSession) -> OrderStatusResponse:

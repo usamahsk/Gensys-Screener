@@ -449,7 +449,11 @@ TELEPHONY_ID_KEYS = (
     "plivo_call_uuid", "telnyx_call_id", "call_uuid", "external_call_id",
     "provider_call_sid", "sip_call_id",
     # Genesys AudioHook ids (conversation id preferred over session)
-    "conversation_id", "conversationId", "session_id", "correlation_id",
+    "conversation_id", "conversationId",
+    "genesys_conversation_id", "genesysConversationId",
+    "session_id", "sessionId", "correlation_id", "correlationId",
+    "genesys_session_id", "genesysSessionId",
+    "genesys_correlation_id", "genesysCorrelationId",
     # Last resort: Dograh often stores the provider-side session UUID under
     # gathered_context.call_id (e.g. Genesys AudioHook session id).
     "call_id",
@@ -478,24 +482,45 @@ def _extract_telephony(detail: dict) -> dict:
     if isinstance(_audiohook, dict):
         scopes.append(_audiohook)
     scopes.append(detail if isinstance(detail, dict) else {})
+    # One extra level: Dograh also nests the ids (audiohook/session blocks)
+    # inside initial/gathered contexts — scan those too.
+    scopes.extend(
+        v for scope in list(scopes)
+        if isinstance(scope, dict)
+        for v in scope.values() if isinstance(v, dict)
+    )
 
     def _scan(keys: tuple[str, ...]) -> str:
-        for k in keys:
-            for scope in scopes:
-                v = scope.get(k)
-                if isinstance(v, str) and v.strip() and "{{" not in v:
+        wanted = {k.lower() for k in keys}
+        for scope in scopes:
+            if not isinstance(scope, dict):
+                continue
+            lowered = {str(k).strip().lower(): v for k, v in scope.items()}
+            for k in keys:
+                for cand in (scope.get(k), lowered.get(k.lower())):
+                    if isinstance(cand, str) and cand.strip() and "{{" not in cand:
+                        return cand.strip()[:128]
+            for lk, v in lowered.items():
+                if lk in wanted and isinstance(v, str) and v.strip() and "{{" not in v:
                     return v.strip()[:128]
         return ""
 
     # Conversation id is the Provider ID — scan it across ALL scopes
-    # (incl. logs.audiohook) before any session/correlation id, so a
-    # session id in initial_context never beats the conversation id.
+    # (incl. logs.audiohook + nested context blocks) before any
+    # session/correlation id, so a session id in initial_context never
+    # beats the conversation id.
+    _CONV_KEYS = ("conversation_id", "conversationId",
+                 "genesys_conversation_id", "genesysConversationId")
+    _SESS_KEYS = ("session_id", "sessionId", "correlation_id", "correlationId",
+                 "genesys_session_id", "genesysSessionId",
+                 "genesys_correlation_id", "genesysCorrelationId")
     provider_call_id = (
-        _scan(("conversation_id", "conversationId"))
+        _scan(_CONV_KEYS)
         or _scan(tuple(k for k in TELEPHONY_ID_KEYS
-                       if k not in ("conversation_id", "conversationId",
-                                    "session_id", "correlation_id", "call_id")))
-        or _scan(("session_id", "correlation_id"))
+                       if k.lower() not in (*[c.lower() for c in _CONV_KEYS],
+                                             *[s.lower() for s in _SESS_KEYS],
+                                             "call_id")))
+        or _scan(_SESS_KEYS)
         or _scan(("call_id",))
     )
 
@@ -984,3 +1009,71 @@ async def delete_kb_document(document_uuid: str, db: AsyncSession = Depends(get_
     except Exception as e:
         raise HTTPException(502, f"Voice platform request failed: {e}")
     return {"status": "deleted", "document_uuid": document_uuid}
+
+
+@router.get("/knowledge-base/{document_uuid}/download")
+async def download_kb_document(document_uuid: str, db: AsyncSession = Depends(get_db)):
+    """Download a KB document's original file through our backend.
+
+    The browser hits this URL directly (anchor with `download`), so the file
+    lands on whatever PC/machine the browser runs on. Resolution order:
+    minted download-url → metadata file/download URL fields → 502 with a
+    clear reason when the voice platform exposes no file bytes.
+    """
+    from fastapi.responses import StreamingResponse
+    from urllib.parse import quote
+
+    s = await _get_setting(db)
+    if not s.api_key:
+        raise HTTPException(400, "No voice platform API key configured")
+    uuid = (document_uuid or "").strip()
+    if not uuid:
+        raise HTTPException(400, "Missing document id")
+
+    meta: dict = {}
+    try:
+        meta = await dograh_client.get_kb_document(s.api_key, s.base_url, uuid)
+        if not isinstance(meta, dict):
+            meta = {}
+    except Exception:
+        meta = {}
+    doc = meta.get("document") if isinstance(meta.get("document"), dict) else meta
+    filename = str(doc.get("filename") or doc.get("file_name") or f"{uuid}.bin")
+
+    candidates: list[str] = []
+    try:
+        dl = await dograh_client.get_kb_download_url(s.api_key, s.base_url, uuid)
+        if isinstance(dl, dict):
+            for k in ("download_url", "downloadUrl", "url", "file_url",
+                      "fileUrl", "presigned_url", "presignedUrl"):
+                v = dl.get(k)
+                if isinstance(v, str) and v.strip():
+                    candidates.append(v.strip())
+    except Exception:
+        pass
+    for k in ("download_url", "downloadUrl", "file_url", "fileUrl",
+              "source_url", "s3_url", "url"):
+        v = doc.get(k)
+        if isinstance(v, str) and v.strip():
+            candidates.append(v.strip())
+    # seen list responses nest the URL one level deeper sometimes
+    for k, v in list(doc.items()):
+        if isinstance(v, dict):
+            for kk in ("download_url", "url", "file_url"):
+                vv = v.get(kk)
+                if isinstance(vv, str) and vv.strip() and vv.strip() not in candidates:
+                    candidates.append(vv.strip())
+
+    for url in candidates:
+        data, content_type, upstream, _hops = await dograh_client.fetch_public_bytes(
+            url, s.base_url)
+        if data:
+            disp = (f"attachment; filename=\"{filename.replace(chr(34), '')}\"; "
+                    f"filename*=UTF-8''{quote(filename)}")
+            return StreamingResponse(iter([data]), media_type=content_type or "application/octet-stream",
+                                     headers={"Content-Disposition": disp})
+    raise HTTPException(
+        502,
+        "No downloadable file URL for this document on the voice platform "
+        "(tried download-url endpoints + metadata file fields). The file may "
+        "be chunked/embedded-only — re-upload the original to keep a copy.")

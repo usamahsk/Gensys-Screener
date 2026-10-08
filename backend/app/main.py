@@ -9,7 +9,7 @@ from loguru import logger
 from app.config import get_settings
 from app.db import engine
 from app.models import Base
-from app.routers import analytics, calls, integration, orders, reports, telephony, tools, transactions, webhooks
+from app.routers import analytics, auth, calls, integration, orders, reports, telephony, tools, transactions, webhooks
 
 settings = get_settings()
 
@@ -63,6 +63,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth.router)
 app.include_router(tools.router)
 app.include_router(webhooks.router)
 app.include_router(orders.router)

@@ -333,6 +333,32 @@ async def delete_kb_document(api_key: str, base_url: str, document_uuid: str) ->
             return {"status": "deleted"}
 
 
+async def get_kb_document(api_key: str, base_url: str, document_uuid: str) -> dict[str, Any]:
+    """Fetch one KB document's metadata (may carry a file/download URL)."""
+    return await _proxy(
+        "GET", f"/knowledge-base/documents/{document_uuid}", api_key, base_url)
+
+
+async def get_kb_download_url(api_key: str, base_url: str, document_uuid: str) -> dict[str, Any]:
+    """Mint a time-limited download URL for one KB document.
+
+    Dograh versions differ on the exact path, so callers should try this
+    first and fall back to metadata URL fields.
+    """
+    for path in (
+        f"/knowledge-base/documents/{document_uuid}/download-url",
+        f"/knowledge-base/documents/{document_uuid}/download_url",
+        f"/knowledge-base/download-url?document_uuid={document_uuid}",
+    ):
+        try:
+            body = await _proxy("GET", path, api_key, base_url)
+            if isinstance(body, dict) and body:
+                return body
+        except DograhProxyError:
+            continue
+    raise DograhProxyError(404, "Voice platform exposes no download URL for this document")
+
+
 # ---------- Telephony configurations (providers + phone numbers) ----------
 
 class DograhProxyError(Exception):
