@@ -1,8 +1,8 @@
 FROM node:22-alpine AS builder
 WORKDIR /app
 
-ARG NEXT_PUBLIC_API_URL=http://localhost:8100
-ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+# Remove ARG — do not bake the URL into the image
+ENV NEXT_PUBLIC_API_URL=http://localhost:8100
 
 COPY package.json pnpm-lock.yaml ./
 RUN corepack enable && pnpm install --frozen-lockfile
